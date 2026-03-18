@@ -39,11 +39,12 @@ class StatusReport:
 
 
 class Repository:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, git_dir: Path | None = None, common_dir: Path | None = None) -> None:
         self.root = root
-        self.git_dir = root / ".treegit"
-        self.store = ObjectStore(self.git_dir)
-        self.index = MetadataIndex(self.git_dir / "index.db")
+        self.git_dir = git_dir or (root / ".treegit")
+        self.common_dir = common_dir or self.git_dir
+        self.store = ObjectStore(self.common_dir)
+        self.index = MetadataIndex(self.common_dir / "index.db")
 
     @classmethod
     def init(cls, root: Path) -> "Repository":
@@ -53,21 +54,29 @@ class Repository:
         repo.git_dir.mkdir(parents=True, exist_ok=False)
         repo.store.init()
         repo.index.init()
+        repo._write_branch("root")
         return repo
 
     @classmethod
     def discover(cls, start: Path) -> "Repository":
         current = start.resolve()
         for candidate in [current, *current.parents]:
-            if (candidate / ".treegit").is_dir():
-                return cls(candidate)
+            git_dir = candidate / ".treegit"
+            if git_dir.is_dir():
+                return cls(candidate, git_dir=git_dir, common_dir=cls._resolve_common_dir(git_dir))
         raise RepoNotFoundError("not inside a TreeGit repository")
 
     def current_branch(self) -> str | None:
+        branch = self._read_branch()
+        if branch is not None:
+            return branch
         kind, target = self.index.read_head()
         return target if kind == "branch" else None
 
     def head_commit_id(self) -> str | None:
+        branch = self.current_branch()
+        if branch is not None:
+            return self.index.get_ref(branch)
         kind, target = self.index.read_head()
         if kind == "branch":
             return self.index.get_ref(target)
@@ -190,33 +199,36 @@ class Repository:
         return records
 
     def checkout(self, revision: str, force: bool = False) -> str:
-        status = self.status()
-        dirty_paths = status.added + status.modified + status.deleted + status.untracked
-        if dirty_paths and not force:
-            raise DirtyWorkingTreeError("working tree is dirty")
         target_branch = self.index.get_branch(revision)
         if target_branch is None:
             raise ReferenceResolutionError("checkout only supports branch names")
-        if not self._can_checkout_branch(target_branch):
-            raise BranchNavigationError(f"can only checkout the parent or a direct child branch from {self.current_branch() or 'HEAD'}")
-        target_commit_id = target_branch.commit_id
-        target_files = {} if target_commit_id is None else self._file_map_for_commit(target_commit_id)
-        current_files = scan_working_tree(self.root)
-        tracked_files = self._head_file_map()
-        conflicts = []
-        for path in target_files:
-            if path not in tracked_files and path in current_files:
-                conflicts.append(path)
-                continue
-            ancestor = self._first_untracked_ancestor(path, current_files, tracked_files)
-            if ancestor is not None:
-                conflicts.append(ancestor)
-        if conflicts:
-            unique_conflicts = ", ".join(sorted(set(conflicts)))
-            raise CheckoutConflictError(f"checkout would overwrite untracked files: {unique_conflicts}")
-        self._materialize_tree(target_files, tracked_files)
-        self.index.update_head("branch", target_branch.name)
-        return target_commit_id or ""
+        return self._switch_branch(target_branch, force=force, require_navigation=True)
+
+    def add_worktree(self, path: Path, branch: str) -> "Repository":
+        target_branch = self.index.get_branch(branch)
+        if target_branch is None:
+            raise ReferenceResolutionError(f"unknown branch {branch}")
+        target_root = path.resolve()
+        if target_root.exists():
+            if not target_root.is_dir():
+                raise RepoExistsError(f"worktree path is not a directory: {target_root}")
+        else:
+            target_root.mkdir(parents=True, exist_ok=False)
+        target_git_dir = target_root / ".treegit"
+        if target_git_dir.exists():
+            repo = Repository(target_root, git_dir=target_git_dir, common_dir=self._resolve_common_dir(target_git_dir))
+            if repo.common_dir.resolve() != self.common_dir.resolve():
+                raise RepoExistsError(f"worktree path belongs to a different repository: {target_root}")
+            repo._switch_branch(target_branch, force=False, require_navigation=False)
+            return repo
+        if any(target_root.iterdir()):
+            raise RepoExistsError(f"worktree path is not empty: {target_root}")
+        target_git_dir.mkdir(parents=True, exist_ok=False)
+        (target_git_dir / "commondir").write_text(str(self.common_dir.resolve()), encoding="utf-8")
+        repo = Repository(target_root, git_dir=target_git_dir, common_dir=self.common_dir)
+        repo._write_branch(target_branch.name)
+        repo._materialize_branch(target_branch)
+        return repo
 
     def diff(self, left: str | None = None, right: str | None = None) -> str:
         if left is None and right is None:
@@ -281,6 +293,64 @@ class Repository:
             return {}
         return self._file_map_for_commit(commit_id)
 
+    @staticmethod
+    def _resolve_common_dir(git_dir: Path) -> Path:
+        commondir_file = git_dir / "commondir"
+        if not commondir_file.exists():
+            return git_dir
+        raw_path = commondir_file.read_text(encoding="utf-8").strip()
+        if not raw_path:
+            raise InvalidObjectError(f"invalid commondir file at {commondir_file}")
+        common_dir = Path(raw_path)
+        if not common_dir.is_absolute():
+            common_dir = (git_dir / common_dir).resolve()
+        return common_dir
+
+    def _branch_file(self) -> Path:
+        return self.git_dir / "BRANCH"
+
+    def _read_branch(self) -> str | None:
+        branch_file = self._branch_file()
+        if not branch_file.exists():
+            return None
+        branch = branch_file.read_text(encoding="utf-8").strip()
+        return branch or None
+
+    def _write_branch(self, branch: str) -> None:
+        self._branch_file().write_text(f"{branch}\n", encoding="utf-8")
+
+    def _switch_branch(self, target_branch: BranchRecord, force: bool, require_navigation: bool) -> str:
+        status = self.status()
+        dirty_paths = status.added + status.modified + status.deleted + status.untracked
+        if dirty_paths and not force:
+            raise DirtyWorkingTreeError("working tree is dirty")
+        if require_navigation and not self._can_checkout_branch(target_branch):
+            raise BranchNavigationError(
+                f"can only checkout the parent or a direct child branch from {self.current_branch() or 'HEAD'}"
+            )
+        target_commit_id = self._materialize_branch(target_branch)
+        return target_commit_id or ""
+
+    def _materialize_branch(self, target_branch: BranchRecord) -> str | None:
+        target_commit_id = target_branch.commit_id
+        target_files = {} if target_commit_id is None else self._file_map_for_commit(target_commit_id)
+        current_files = scan_working_tree(self.root)
+        tracked_files = self._head_file_map()
+        conflicts = []
+        for path in target_files:
+            if path not in tracked_files and path in current_files:
+                conflicts.append(path)
+                continue
+            ancestor = self._first_untracked_ancestor(path, current_files, tracked_files)
+            if ancestor is not None:
+                conflicts.append(ancestor)
+        if conflicts:
+            unique_conflicts = ", ".join(sorted(set(conflicts)))
+            raise CheckoutConflictError(f"checkout would overwrite untracked files: {unique_conflicts}")
+        self._materialize_tree(target_files, tracked_files)
+        self._write_branch(target_branch.name)
+        return target_commit_id
+
     def _file_map_for_commit(self, commit_id: str) -> dict[str, FileSnapshot]:
         return {item.path: item for item in self.index.files_for_commit(commit_id)}
 
@@ -289,6 +359,8 @@ class Repository:
         if current_name is None:
             return target_branch.parent_name is None
         if target_branch.name == current_name:
+            return True
+        if target_branch.parent_name is None:
             return True
         current_branch = self.index.get_branch(current_name)
         if current_branch is None:

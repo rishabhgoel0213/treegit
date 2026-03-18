@@ -24,6 +24,12 @@ def build_parser() -> argparse.ArgumentParser:
     branch_parser = subparsers.add_parser("branch")
     branch_parser.add_argument("name", nargs="?")
 
+    worktree_parser = subparsers.add_parser("worktree")
+    worktree_subparsers = worktree_parser.add_subparsers(dest="worktree_command", required=True)
+    worktree_add_parser = worktree_subparsers.add_parser("add")
+    worktree_add_parser.add_argument("path")
+    worktree_add_parser.add_argument("branch")
+
     checkout_parser = subparsers.add_parser("checkout")
     checkout_parser.add_argument("revision")
     checkout_parser.add_argument("--force", action="store_true")
@@ -108,6 +114,11 @@ def run_command(args: argparse.Namespace) -> int:
 
         render(None, 0)
         return 0
+    if args.command == "worktree":
+        if args.worktree_command == "add":
+            worktree = repo.add_worktree(Path(args.path), args.branch)
+            print(f"Created worktree for {args.branch} at {worktree.root}")
+            return 0
     if args.command == "checkout":
         commit_id = repo.checkout(args.revision, force=args.force)
         print(commit_id)

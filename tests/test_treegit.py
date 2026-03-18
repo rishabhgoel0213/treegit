@@ -37,7 +37,11 @@ class TreeGitTestCase(unittest.TestCase):
         self.tempdir.cleanup()
 
     def init_repo(self) -> Repository:
-        return Repository.init(self.workspace)
+        return self.init_repo_at(self.workspace)
+
+    def init_repo_at(self, path: Path) -> Repository:
+        path.mkdir(parents=True, exist_ok=True)
+        return Repository.init(path)
 
     def write_text(self, relative_path: str, content: str, executable: bool = False) -> None:
         target = self.workspace / relative_path
@@ -186,6 +190,9 @@ class RepositoryIntegrationTests(TreeGitTestCase):
 
         repo.checkout("leaf", force=True)
         self.assertEqual(repo.current_branch(), "leaf")
+        repo.checkout("root", force=True)
+        self.assertEqual(repo.current_branch(), "root")
+        self.assertEqual((self.workspace / "main.txt").read_text(encoding="utf-8"), "root\n")
         repo.checkout("feature", force=True)
         self.assertEqual(repo.current_branch(), "feature")
 
@@ -266,6 +273,65 @@ class RepositoryIntegrationTests(TreeGitTestCase):
                 repo.commit("interrupted")
         self.assertEqual(repo.head_commit_id(), stable_head)
 
+    def test_linked_worktrees_keep_branch_state_local_while_sharing_history(self) -> None:
+        main_dir = self.workspace / "main"
+        feature_dir = self.workspace / "feature"
+        alt_dir = self.workspace / "alt"
+
+        repo = self.init_repo_at(main_dir)
+        (main_dir / "shared.txt").write_text("root\n", encoding="utf-8")
+        root_commit = repo.commit("root base")
+        repo.create_branch("feature")
+        repo.create_branch("alt")
+
+        feature_repo = repo.add_worktree(feature_dir, "feature")
+        alt_repo = repo.add_worktree(alt_dir, "alt")
+
+        self.assertEqual(feature_repo.common_dir, repo.common_dir)
+        self.assertEqual(alt_repo.common_dir, repo.common_dir)
+        self.assertEqual(repo.current_branch(), "root")
+        self.assertEqual(feature_repo.current_branch(), "feature")
+        self.assertEqual(alt_repo.current_branch(), "alt")
+        self.assertEqual((feature_dir / "shared.txt").read_text(encoding="utf-8"), "root\n")
+        self.assertEqual((alt_dir / "shared.txt").read_text(encoding="utf-8"), "root\n")
+
+        (feature_dir / "shared.txt").write_text("feature\n", encoding="utf-8")
+        feature_commit = feature_repo.commit("feature work")
+
+        self.assertEqual(repo.resolve_revision("root"), root_commit)
+        self.assertEqual(repo.resolve_revision("feature"), feature_commit)
+        self.assertEqual(repo.current_branch(), "root")
+        self.assertEqual(alt_repo.current_branch(), "alt")
+        self.assertEqual((main_dir / "shared.txt").read_text(encoding="utf-8"), "root\n")
+        self.assertEqual((alt_dir / "shared.txt").read_text(encoding="utf-8"), "root\n")
+        self.assertFalse(repo.status().is_dirty())
+        self.assertFalse(alt_repo.status().is_dirty())
+
+        repo.checkout("feature", force=True)
+        self.assertEqual(repo.current_branch(), "feature")
+        self.assertEqual(alt_repo.current_branch(), "alt")
+        self.assertEqual((main_dir / "shared.txt").read_text(encoding="utf-8"), "feature\n")
+        self.assertEqual((alt_dir / "shared.txt").read_text(encoding="utf-8"), "root\n")
+
+    def test_worktree_add_can_rebind_existing_worktree_to_another_branch(self) -> None:
+        main_dir = self.workspace / "main"
+        feature_dir = self.workspace / "feature"
+
+        repo = self.init_repo_at(main_dir)
+        (main_dir / "shared.txt").write_text("root\n", encoding="utf-8")
+        repo.commit("root base")
+        repo.create_branch("feature")
+        repo.create_branch("alt")
+
+        feature_repo = repo.add_worktree(feature_dir, "feature")
+        (feature_dir / "shared.txt").write_text("feature\n", encoding="utf-8")
+        feature_commit = feature_repo.commit("feature work")
+
+        rebound_repo = repo.add_worktree(feature_dir, "alt")
+        self.assertEqual(rebound_repo.current_branch(), "alt")
+        self.assertEqual((feature_dir / "shared.txt").read_text(encoding="utf-8"), "root\n")
+        self.assertEqual(repo.resolve_revision("feature"), feature_commit)
+
 
 class CliSmokeTests(TreeGitTestCase):
     def test_cli_round_trip(self) -> None:
@@ -308,6 +374,64 @@ class CliSmokeTests(TreeGitTestCase):
         log = self.run_cli("log")
         self.assertEqual(log.returncode, 0, log.stderr)
         self.assertIn("initial", log.stdout)
+
+    def test_cli_worktree_add_creates_independent_local_branch_binding(self) -> None:
+        main_dir = self.workspace / "main"
+        feature_dir = self.workspace / "feature"
+        main_dir.mkdir()
+
+        result = self.run_cli("init", cwd=main_dir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        (main_dir / "notes.txt").write_text("root\n", encoding="utf-8")
+        commit_root = self.run_cli("commit", "-m", "initial", cwd=main_dir)
+        self.assertEqual(commit_root.returncode, 0, commit_root.stderr)
+
+        create_branch = self.run_cli("branch", "feature", cwd=main_dir)
+        self.assertEqual(create_branch.returncode, 0, create_branch.stderr)
+
+        add_worktree = self.run_cli("worktree", "add", str(feature_dir), "feature", cwd=main_dir)
+        self.assertEqual(add_worktree.returncode, 0, add_worktree.stderr)
+        self.assertEqual((feature_dir / "notes.txt").read_text(encoding="utf-8"), "root\n")
+
+        feature_branch = self.run_cli("branch", cwd=feature_dir)
+        self.assertEqual(feature_branch.returncode, 0, feature_branch.stderr)
+        self.assertIn("*   feature", feature_branch.stdout)
+
+        main_branch = self.run_cli("branch", cwd=main_dir)
+        self.assertEqual(main_branch.returncode, 0, main_branch.stderr)
+        self.assertIn("* root", main_branch.stdout)
+
+    def test_cli_worktree_add_rebinds_existing_worktree_folder(self) -> None:
+        main_dir = self.workspace / "main"
+        feature_dir = self.workspace / "feature"
+        main_dir.mkdir()
+
+        result = self.run_cli("init", cwd=main_dir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        (main_dir / "notes.txt").write_text("root\n", encoding="utf-8")
+        commit_root = self.run_cli("commit", "-m", "initial", cwd=main_dir)
+        self.assertEqual(commit_root.returncode, 0, commit_root.stderr)
+
+        create_feature = self.run_cli("branch", "feature", cwd=main_dir)
+        self.assertEqual(create_feature.returncode, 0, create_feature.stderr)
+        create_alt = self.run_cli("branch", "alt", cwd=main_dir)
+        self.assertEqual(create_alt.returncode, 0, create_alt.stderr)
+
+        add_worktree = self.run_cli("worktree", "add", str(feature_dir), "feature", cwd=main_dir)
+        self.assertEqual(add_worktree.returncode, 0, add_worktree.stderr)
+        (feature_dir / "notes.txt").write_text("feature\n", encoding="utf-8")
+        commit_feature = self.run_cli("commit", "-m", "feature update", cwd=feature_dir)
+        self.assertEqual(commit_feature.returncode, 0, commit_feature.stderr)
+
+        rebind_worktree = self.run_cli("worktree", "add", str(feature_dir), "alt", cwd=main_dir)
+        self.assertEqual(rebind_worktree.returncode, 0, rebind_worktree.stderr)
+        self.assertEqual((feature_dir / "notes.txt").read_text(encoding="utf-8"), "root\n")
+
+        feature_branch = self.run_cli("branch", cwd=feature_dir)
+        self.assertEqual(feature_branch.returncode, 0, feature_branch.stderr)
+        self.assertIn("*   alt", feature_branch.stdout)
 
 
 if __name__ == "__main__":
