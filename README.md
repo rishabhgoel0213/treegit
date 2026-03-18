@@ -47,21 +47,21 @@ treegit status
 treegit commit -m "initial snapshot"
 
 treegit branch feature
-treegit checkout feature --force
+treegit checkout feature
 
 # edit files on feature
 treegit commit -m "feature work"
 
 treegit branch leaf
-treegit checkout leaf --force
+treegit checkout leaf
 ```
 
 To move between sibling branches, go through the parent branch:
 
 ```bash
-treegit checkout feature --force
-treegit checkout root --force
-treegit checkout other-feature --force
+treegit checkout feature
+treegit checkout root
+treegit checkout other-feature
 ```
 
 ## Commands
@@ -83,3 +83,4 @@ treegit search <query> [--field content|path|commit|branch|all] [--branch name] 
 - `.treegit/` internals are never tracked.
 - Search is local and indexed with SQLite.
 - Binary files are tracked, but content search only indexes text files up to 1 MiB.
+- `--force` is only needed when you want checkout to discard uncommitted local changes.
