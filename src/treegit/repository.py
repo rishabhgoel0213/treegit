@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 
@@ -164,7 +164,7 @@ class Repository:
         working_files = scan_working_tree(self.root)
         parent = self.head_commit()
         tree_id, files = self._write_tree_from_working_files(working_files)
-        created_at = datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        created_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         payload = serialize_commit(parent.commit_id if parent else None, tree_id, message, created_at)
         commit_id = self.store.write_object("commit", payload)
         commit = CommitRecord(

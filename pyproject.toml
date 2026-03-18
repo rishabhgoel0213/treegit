@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "treegit"
 version = "0.1.0"
 description = "A local-only Git-shaped version control system for exploring codebase trees."
-requires-python = ">=3.13"
+requires-python = ">=3.9"
 
 [project.scripts]
 treegit = "treegit.cli:main"
