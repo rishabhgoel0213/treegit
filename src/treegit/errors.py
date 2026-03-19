@@ -36,3 +36,11 @@ class BranchExistsError(TreeGitError):
 
 class BranchNavigationError(TreeGitError):
     """Raised when checkout targets a non-adjacent branch."""
+
+
+class MetricExistsError(TreeGitError):
+    """Raised when creating a metric that already exists."""
+
+
+class MetricNotFoundError(TreeGitError):
+    """Raised when reading or updating an unknown metric."""

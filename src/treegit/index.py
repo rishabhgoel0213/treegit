@@ -65,6 +65,21 @@ CREATE VIRTUAL TABLE IF NOT EXISTS commit_fts USING fts5(
 CREATE VIRTUAL TABLE IF NOT EXISTS branch_fts USING fts5(
     name
 );
+
+CREATE TABLE IF NOT EXISTS metrics (
+    name TEXT PRIMARY KEY
+);
+
+CREATE TABLE IF NOT EXISTS branch_metrics (
+    branch_name TEXT NOT NULL,
+    metric_name TEXT NOT NULL,
+    value REAL NOT NULL,
+    PRIMARY KEY (branch_name, metric_name),
+    FOREIGN KEY (branch_name) REFERENCES refs(name),
+    FOREIGN KEY (metric_name) REFERENCES metrics(name)
+);
+
+CREATE INDEX IF NOT EXISTS branch_metrics_metric_idx ON branch_metrics(metric_name);
 """
 
 
@@ -193,6 +208,15 @@ class MetadataIndex:
                 (name, commit_id, parent_name, fork_commit_id),
             )
             conn.execute("INSERT INTO branch_fts(name) VALUES (?)", (name,))
+            metrics = conn.execute("SELECT name FROM metrics ORDER BY name").fetchall()
+            for metric in metrics:
+                conn.execute(
+                    """
+                    INSERT INTO branch_metrics(branch_name, metric_name, value)
+                    VALUES (?, ?, 0.0)
+                    """,
+                    (name, metric["name"]),
+                )
             conn.commit()
         finally:
             conn.close()
@@ -341,6 +365,83 @@ class MetadataIndex:
                 (query, limit),
             ).fetchall()
             return [row["name"] for row in rows]
+        finally:
+            conn.close()
+
+    def has_metric(self, name: str) -> bool:
+        conn = self.connect()
+        try:
+            row = conn.execute("SELECT 1 FROM metrics WHERE name = ?", (name,)).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+    def define_metric(self, name: str, default: float = 0.0) -> None:
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN")
+            conn.execute("INSERT INTO metrics(name) VALUES (?)", (name,))
+            branches = conn.execute("SELECT name FROM refs ORDER BY name").fetchall()
+            for branch in branches:
+                conn.execute(
+                    """
+                    INSERT INTO branch_metrics(branch_name, metric_name, value)
+                    VALUES (?, ?, ?)
+                    """,
+                    (branch["name"], name, default),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_branch_metric(self, branch_name: str, metric_name: str) -> float | None:
+        conn = self.connect()
+        try:
+            exists = conn.execute("SELECT 1 FROM metrics WHERE name = ?", (metric_name,)).fetchone()
+            if exists is None:
+                return None
+            row = conn.execute(
+                """
+                SELECT value
+                FROM branch_metrics
+                WHERE branch_name = ? AND metric_name = ?
+                """,
+                (branch_name, metric_name),
+            ).fetchone()
+            if row is None:
+                return 0.0
+            return float(row["value"])
+        finally:
+            conn.close()
+
+    def increment_metric_for_branches(self, metric_name: str, branch_names: list[str], delta: float) -> None:
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN")
+            for branch_name in branch_names:
+                conn.execute(
+                    """
+                    INSERT INTO branch_metrics(branch_name, metric_name, value)
+                    VALUES (?, ?, 0.0)
+                    ON CONFLICT(branch_name, metric_name) DO NOTHING
+                    """,
+                    (branch_name, metric_name),
+                )
+                conn.execute(
+                    """
+                    UPDATE branch_metrics
+                    SET value = value + ?
+                    WHERE branch_name = ? AND metric_name = ?
+                    """,
+                    (delta, branch_name, metric_name),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 

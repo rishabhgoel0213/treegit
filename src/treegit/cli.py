@@ -45,6 +45,19 @@ def build_parser() -> argparse.ArgumentParser:
     search_parser.add_argument("--path")
     search_parser.add_argument("--limit", type=int, default=20)
 
+    metric_parser = subparsers.add_parser("metric")
+    metric_subparsers = metric_parser.add_subparsers(dest="metric_command", required=True)
+
+    metric_define_parser = metric_subparsers.add_parser("define")
+    metric_define_parser.add_argument("name")
+
+    metric_get_parser = metric_subparsers.add_parser("get")
+    metric_get_parser.add_argument("name")
+
+    metric_backprop_parser = metric_subparsers.add_parser("backprop")
+    metric_backprop_parser.add_argument("name")
+    metric_backprop_parser.add_argument("value", type=float)
+
     return parser
 
 
@@ -144,4 +157,14 @@ def run_command(args: argparse.Namespace) -> int:
                 suffix = f" ({item.created_at})" if item.created_at else ""
                 print(f"  {item.ref} {details}{suffix}")
         return 0
+    if args.command == "metric":
+        if args.metric_command == "define":
+            repo.define_metric(args.name)
+            return 0
+        if args.metric_command == "get":
+            print(repo.get_metric(args.name))
+            return 0
+        if args.metric_command == "backprop":
+            repo.backprop_metric(args.name, args.value)
+            return 0
     return 0

@@ -20,6 +20,9 @@ It is intentionally simpler than Git:
   Re-running it for an existing linked worktree folder moves that folder to the requested branch.
 - `treegit checkout <branch>` only works with branch names.
 - You can check out `root` from anywhere; otherwise checkout is limited to your parent branch or a direct child branch.
+- `treegit metric define <name>` creates a shared branch metric initialized to `0.0` on all existing and future branches.
+- `treegit metric get <name>` reads the metric for the current branch.
+- `treegit metric backprop <name> <value>` increments the metric on the current branch and all of its parents.
 - `treegit branch` prints the branch tree.
 
 There is no `treegit add`.
@@ -79,6 +82,9 @@ treegit worktree add <path> <branch>
 treegit checkout <branch> [--force]
 treegit diff [left] [right]
 treegit search <query> [--field content|path|commit|branch|all] [--branch name] [--path glob] [--limit N]
+treegit metric define <name>
+treegit metric get <name>
+treegit metric backprop <name> <value>
 ```
 
 ## Notes
@@ -86,6 +92,7 @@ treegit search <query> [--field content|path|commit|branch|all] [--branch name] 
 - Ignored files can be listed in `.treegitignore`.
 - `.treegit/` internals are never tracked.
 - Additional worktrees keep their own local branch selection while sharing the same objects and index.
+- Metrics are shared across worktrees because they live in the shared index.
 - Search is local and indexed with SQLite.
 - Binary files are tracked, but content search only indexes text files up to 1 MiB.
 - `--force` is only needed when you want checkout to discard uncommitted local changes.

@@ -20,6 +20,8 @@ from treegit.errors import (  # noqa: E402
     CheckoutConflictError,
     DirtyWorkingTreeError,
     InvalidObjectError,
+    MetricExistsError,
+    MetricNotFoundError,
     UnsupportedFileError,
 )
 from treegit.hashing import object_id  # noqa: E402
@@ -313,6 +315,55 @@ class RepositoryIntegrationTests(TreeGitTestCase):
         self.assertEqual((main_dir / "shared.txt").read_text(encoding="utf-8"), "feature\n")
         self.assertEqual((alt_dir / "shared.txt").read_text(encoding="utf-8"), "root\n")
 
+    def test_metrics_define_get_backprop_and_auto_initialize_new_branches(self) -> None:
+        repo = self.init_repo()
+        self.write_text("main.txt", "root\n")
+        repo.commit("root base")
+        repo.create_branch("feature")
+        repo.checkout("feature", force=True)
+        repo.create_branch("leaf")
+        repo.checkout("root", force=True)
+        repo.create_branch("alt")
+
+        repo.define_metric("score")
+        self.assertEqual(repo.get_metric("score"), 0.0)
+
+        repo.checkout("feature", force=True)
+        self.assertEqual(repo.get_metric("score"), 0.0)
+        repo.checkout("leaf", force=True)
+        self.assertEqual(repo.get_metric("score"), 0.0)
+
+        repo.backprop_metric("score", 1.5)
+        self.assertEqual(repo.get_metric("score"), 1.5)
+
+        repo.checkout("feature", force=True)
+        self.assertEqual(repo.get_metric("score"), 1.5)
+        repo.create_branch("newleaf")
+
+        repo.checkout("root", force=True)
+        self.assertEqual(repo.get_metric("score"), 1.5)
+
+        repo.checkout("alt", force=True)
+        self.assertEqual(repo.get_metric("score"), 0.0)
+
+        repo.checkout("root", force=True)
+        repo.checkout("feature", force=True)
+        repo.checkout("newleaf", force=True)
+        self.assertEqual(repo.get_metric("score"), 0.0)
+
+    def test_metric_errors_for_duplicate_and_unknown_names(self) -> None:
+        repo = self.init_repo()
+        repo.define_metric("score")
+
+        with self.assertRaises(MetricExistsError):
+            repo.define_metric("score")
+
+        with self.assertRaises(MetricNotFoundError):
+            repo.get_metric("missing")
+
+        with self.assertRaises(MetricNotFoundError):
+            repo.backprop_metric("missing", 1.0)
+
     def test_worktree_add_can_rebind_existing_worktree_to_another_branch(self) -> None:
         main_dir = self.workspace / "main"
         feature_dir = self.workspace / "feature"
@@ -432,6 +483,61 @@ class CliSmokeTests(TreeGitTestCase):
         feature_branch = self.run_cli("branch", cwd=feature_dir)
         self.assertEqual(feature_branch.returncode, 0, feature_branch.stderr)
         self.assertIn("*   alt", feature_branch.stdout)
+
+    def test_cli_metric_define_get_and_backprop(self) -> None:
+        result = self.run_cli("init")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        self.write_text("notes.txt", "root\n")
+        commit_root = self.run_cli("commit", "-m", "initial")
+        self.assertEqual(commit_root.returncode, 0, commit_root.stderr)
+
+        define_metric = self.run_cli("metric", "define", "score")
+        self.assertEqual(define_metric.returncode, 0, define_metric.stderr)
+
+        root_score = self.run_cli("metric", "get", "score")
+        self.assertEqual(root_score.returncode, 0, root_score.stderr)
+        self.assertEqual(float(root_score.stdout.strip()), 0.0)
+
+        create_feature = self.run_cli("branch", "feature")
+        self.assertEqual(create_feature.returncode, 0, create_feature.stderr)
+
+        checkout_feature = self.run_cli("checkout", "feature", "--force")
+        self.assertEqual(checkout_feature.returncode, 0, checkout_feature.stderr)
+
+        create_leaf = self.run_cli("branch", "leaf")
+        self.assertEqual(create_leaf.returncode, 0, create_leaf.stderr)
+
+        checkout_leaf = self.run_cli("checkout", "leaf", "--force")
+        self.assertEqual(checkout_leaf.returncode, 0, checkout_leaf.stderr)
+
+        leaf_score = self.run_cli("metric", "get", "score")
+        self.assertEqual(leaf_score.returncode, 0, leaf_score.stderr)
+        self.assertEqual(float(leaf_score.stdout.strip()), 0.0)
+
+        backprop_score = self.run_cli("metric", "backprop", "score", "2.5")
+        self.assertEqual(backprop_score.returncode, 0, backprop_score.stderr)
+
+        updated_leaf_score = self.run_cli("metric", "get", "score")
+        self.assertEqual(updated_leaf_score.returncode, 0, updated_leaf_score.stderr)
+        self.assertEqual(float(updated_leaf_score.stdout.strip()), 2.5)
+
+        checkout_root = self.run_cli("checkout", "root", "--force")
+        self.assertEqual(checkout_root.returncode, 0, checkout_root.stderr)
+
+        updated_root_score = self.run_cli("metric", "get", "score")
+        self.assertEqual(updated_root_score.returncode, 0, updated_root_score.stderr)
+        self.assertEqual(float(updated_root_score.stdout.strip()), 2.5)
+
+        create_alt = self.run_cli("branch", "alt")
+        self.assertEqual(create_alt.returncode, 0, create_alt.stderr)
+
+        checkout_alt = self.run_cli("checkout", "alt", "--force")
+        self.assertEqual(checkout_alt.returncode, 0, checkout_alt.stderr)
+
+        alt_score = self.run_cli("metric", "get", "score")
+        self.assertEqual(alt_score.returncode, 0, alt_score.stderr)
+        self.assertEqual(float(alt_score.stdout.strip()), 0.0)
 
 
 if __name__ == "__main__":

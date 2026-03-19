@@ -13,6 +13,8 @@ from treegit.errors import (
     CheckoutConflictError,
     DirtyWorkingTreeError,
     InvalidObjectError,
+    MetricExistsError,
+    MetricNotFoundError,
     ReferenceResolutionError,
     RepoExistsError,
     RepoNotFoundError,
@@ -63,7 +65,9 @@ class Repository:
         for candidate in [current, *current.parents]:
             git_dir = candidate / ".treegit"
             if git_dir.is_dir():
-                return cls(candidate, git_dir=git_dir, common_dir=cls._resolve_common_dir(git_dir))
+                repo = cls(candidate, git_dir=git_dir, common_dir=cls._resolve_common_dir(git_dir))
+                repo.index.init()
+                return repo
         raise RepoNotFoundError("not inside a TreeGit repository")
 
     def current_branch(self) -> str | None:
@@ -134,6 +138,38 @@ class Repository:
             parent_name=self.current_branch(),
             fork_commit_id=self.head_commit_id(),
         )
+
+    def define_metric(self, name: str) -> None:
+        if self.index.has_metric(name):
+            raise MetricExistsError(f"metric {name} already exists")
+        self.index.define_metric(name, default=0.0)
+
+    def get_metric(self, name: str) -> float:
+        branch_name = self.current_branch()
+        if branch_name is None:
+            raise ReferenceResolutionError("metric operations require a branch checkout")
+        value = self.index.get_branch_metric(branch_name, name)
+        if value is None:
+            raise MetricNotFoundError(f"unknown metric {name}")
+        return value
+
+    def backprop_metric(self, name: str, value: float) -> None:
+        branch_name = self.current_branch()
+        if branch_name is None:
+            raise ReferenceResolutionError("metric operations require a branch checkout")
+        if not self.index.has_metric(name):
+            raise MetricNotFoundError(f"unknown metric {name}")
+        lineage: list[str] = []
+        seen: set[str] = set()
+        current_name: str | None = branch_name
+        while current_name is not None and current_name not in seen:
+            seen.add(current_name)
+            lineage.append(current_name)
+            branch = self.index.get_branch(current_name)
+            if branch is None:
+                raise ReferenceResolutionError(f"unknown branch {current_name}")
+            current_name = branch.parent_name
+        self.index.increment_metric_for_branches(name, lineage, value)
 
     def status(self) -> StatusReport:
         head_files = self._head_file_map()
