@@ -19,6 +19,9 @@ class ObjectStore:
     def path_for(self, oid: str) -> Path:
         return self.objects_dir / oid[:2] / oid[2:]
 
+    def has_object(self, oid: str) -> bool:
+        return self.path_for(oid).exists()
+
     def write_object(self, kind: str, payload: bytes) -> str:
         oid = object_id(kind, payload)
         target = self.path_for(oid)

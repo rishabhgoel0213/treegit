@@ -39,7 +39,7 @@ class FileSnapshot:
 class WorkingFile:
     path: str
     mode: str
-    raw: bytes
+    raw: bytes | None
     size: int
     is_text: bool
     blob_id: str

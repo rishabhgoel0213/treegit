@@ -44,3 +44,19 @@ class MetricExistsError(TreeGitError):
 
 class MetricNotFoundError(TreeGitError):
     """Raised when reading or updating an unknown metric."""
+
+
+class MCTSConfigError(TreeGitError):
+    """Raised when an MCTS config file is invalid."""
+
+
+class MCTSRunNotFoundError(TreeGitError):
+    """Raised when an MCTS run cannot be found."""
+
+
+class MCTSSelectionError(TreeGitError):
+    """Raised when no node is available for expansion."""
+
+
+class MCTSExecutionError(TreeGitError):
+    """Raised when an external MCTS command cannot be executed."""

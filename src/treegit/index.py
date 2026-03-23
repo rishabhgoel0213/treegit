@@ -7,6 +7,9 @@ from pathlib import Path
 from treegit.models import BranchRecord, CommitRecord, FileSnapshot
 
 
+SQLITE_BATCH_SIZE = 900
+
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 
@@ -41,6 +44,32 @@ CREATE TABLE IF NOT EXISTS commit_files (
     PRIMARY KEY (commit_id, path)
 );
 
+CREATE TABLE IF NOT EXISTS commit_changes (
+    commit_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    blob_id TEXT,
+    mode TEXT,
+    size INTEGER,
+    is_text INTEGER,
+    deleted INTEGER NOT NULL,
+    PRIMARY KEY (commit_id, path)
+);
+
+CREATE TABLE IF NOT EXISTS commit_manifest_state (
+    commit_id TEXT PRIMARY KEY,
+    ready INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS branch_tip_files (
+    branch_name TEXT NOT NULL,
+    path TEXT NOT NULL,
+    blob_id TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    is_text INTEGER NOT NULL,
+    PRIMARY KEY (branch_name, path)
+);
+
 CREATE TABLE IF NOT EXISTS blobs (
     blob_id TEXT PRIMARY KEY,
     size INTEGER NOT NULL,
@@ -50,7 +79,9 @@ CREATE TABLE IF NOT EXISTS blobs (
 
 CREATE INDEX IF NOT EXISTS commit_files_commit_idx ON commit_files(commit_id);
 CREATE INDEX IF NOT EXISTS commit_files_path_idx ON commit_files(path);
+CREATE INDEX IF NOT EXISTS commit_changes_commit_idx ON commit_changes(commit_id);
 CREATE INDEX IF NOT EXISTS commits_parent_idx ON commits(parent_id);
+CREATE INDEX IF NOT EXISTS branch_tip_files_branch_idx ON branch_tip_files(branch_name);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS blob_fts USING fts5(
     blob_id UNINDEXED,
@@ -111,6 +142,46 @@ class MetadataIndex:
                 """
             )
             conn.execute("INSERT OR IGNORE INTO branch_fts(name) VALUES ('root')")
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO commit_manifest_state(commit_id, ready)
+                SELECT c.commit_id,
+                       CASE
+                           WHEN c.parent_id IS NULL THEN 1
+                           WHEN EXISTS(
+                               SELECT 1
+                               FROM commit_files cf
+                               WHERE cf.commit_id = c.commit_id
+                           ) THEN 1
+                           ELSE 0
+                       END
+                FROM commits c
+                """
+            )
+            branches = conn.execute(
+                """
+                SELECT name, commit_id
+                FROM refs
+                WHERE commit_id IS NOT NULL
+                ORDER BY name
+                """
+            ).fetchall()
+            for branch in branches:
+                exists = conn.execute(
+                    "SELECT 1 FROM branch_tip_files WHERE branch_name = ? LIMIT 1",
+                    (branch["name"],),
+                ).fetchone()
+                if exists is not None:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO branch_tip_files(branch_name, path, blob_id, mode, size, is_text)
+                    SELECT ?, path, blob_id, mode, size, is_text
+                    FROM commit_files
+                    WHERE commit_id = ?
+                    """,
+                    (branch["name"], branch["commit_id"]),
+                )
             conn.commit()
         finally:
             conn.close()
@@ -256,12 +327,31 @@ class MetadataIndex:
         finally:
             conn.close()
 
+    def unindexed_text_blob_ids(self, blob_ids: set[str]) -> set[str]:
+        if not blob_ids:
+            return set()
+        conn = self.connect()
+        try:
+            indexed: set[str] = set()
+            for chunk in _chunked(sorted(blob_ids), SQLITE_BATCH_SIZE):
+                placeholders = ",".join("?" for _ in chunk)
+                rows = conn.execute(
+                    f"SELECT blob_id FROM blob_fts WHERE blob_id IN ({placeholders})",
+                    tuple(chunk),
+                ).fetchall()
+                indexed.update(row["blob_id"] for row in rows)
+            return blob_ids - indexed
+        finally:
+            conn.close()
+
     def write_commit(
         self,
         commit: CommitRecord,
         files: list[FileSnapshot],
         branch_name: str | None,
         blob_contents: dict[str, str],
+        parent_commit_id: str | None = None,
+        deleted_paths: set[str] | None = None,
     ) -> None:
         conn = self.connect()
         try:
@@ -274,28 +364,222 @@ class MetadataIndex:
                 (commit.commit_id, commit.parent_id, commit.root_tree_id, commit.message, commit.created_at),
             )
             conn.execute("INSERT INTO commit_fts(commit_id, message) VALUES (?, ?)", (commit.commit_id, commit.message))
-            for item in files:
+            file_rows = [
+                (commit.commit_id, item.path, item.blob_id, item.mode, item.size, int(item.is_text))
+                for item in files
+            ]
+            conn.execute(
+                """
+                INSERT INTO commit_manifest_state(commit_id, ready)
+                VALUES (?, ?)
+                ON CONFLICT(commit_id) DO UPDATE SET ready = excluded.ready
+                """,
+                (commit.commit_id, int(parent_commit_id is None)),
+            )
+            if file_rows:
+                conn.executemany(
+                    """
+                    INSERT INTO commit_changes(commit_id, path, blob_id, mode, size, is_text, deleted)
+                    VALUES (?, ?, ?, ?, ?, ?, 0)
+                    """,
+                    file_rows,
+                )
+            if deleted_paths:
+                conn.executemany(
+                    """
+                    INSERT INTO commit_changes(commit_id, path, blob_id, mode, size, is_text, deleted)
+                    VALUES (?, ?, NULL, NULL, NULL, NULL, 1)
+                    """,
+                    [(commit.commit_id, path) for path in sorted(deleted_paths)],
+                )
+            if file_rows:
+                if parent_commit_id is None:
+                    conn.executemany(
+                        """
+                        INSERT INTO commit_files(commit_id, path, blob_id, mode, size, is_text)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        file_rows,
+                    )
+                blob_rows: dict[str, tuple[str, int, int, int]] = {}
+                for item in files:
+                    blob_rows[item.blob_id] = (
+                        item.blob_id,
+                        item.size,
+                        int(item.is_text),
+                        int(item.blob_id in blob_contents),
+                    )
+                conn.executemany(
+                    """
+                    INSERT INTO blobs(blob_id, size, is_text, indexed_content)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(blob_id) DO UPDATE SET
+                        indexed_content = CASE
+                            WHEN blobs.indexed_content = 1 OR excluded.indexed_content = 1 THEN 1
+                            ELSE 0
+                        END
+                    """,
+                    list(blob_rows.values()),
+                )
+            if blob_contents:
+                existing: set[str] = set()
+                for chunk in _chunked(sorted(blob_contents), SQLITE_BATCH_SIZE):
+                    placeholders = ",".join("?" for _ in chunk)
+                    rows = conn.execute(
+                        f"SELECT blob_id FROM blob_fts WHERE blob_id IN ({placeholders})",
+                        tuple(chunk),
+                    ).fetchall()
+                    existing.update(row["blob_id"] for row in rows)
+                pending = [
+                    (blob_id, content)
+                    for blob_id, content in blob_contents.items()
+                    if blob_id not in existing
+                ]
+                if pending:
+                    conn.executemany(
+                        "INSERT INTO blob_fts(blob_id, content) VALUES (?, ?)",
+                        pending,
+                    )
+            if branch_name is not None:
+                self._apply_branch_tip_changes(conn, branch_name, files, deleted_paths or set(), parent_commit_id is None)
+                conn.execute("UPDATE refs SET commit_id = ? WHERE name = ?", (commit.commit_id, branch_name))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _apply_branch_tip_changes(
+        self,
+        conn: sqlite3.Connection,
+        branch_name: str,
+        files: list[FileSnapshot],
+        deleted_paths: set[str],
+        replace_all: bool,
+    ) -> None:
+        if replace_all:
+            conn.execute("DELETE FROM branch_tip_files WHERE branch_name = ?", (branch_name,))
+        elif deleted_paths:
+            for chunk in _chunked(sorted(deleted_paths), SQLITE_BATCH_SIZE):
+                placeholders = ",".join("?" for _ in chunk)
                 conn.execute(
+                    f"DELETE FROM branch_tip_files WHERE branch_name = ? AND path IN ({placeholders})",
+                    (branch_name, *chunk),
+                )
+        if not files:
+            return
+        conn.executemany(
+            """
+            INSERT INTO branch_tip_files(branch_name, path, blob_id, mode, size, is_text)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(branch_name, path) DO UPDATE SET
+                blob_id = excluded.blob_id,
+                mode = excluded.mode,
+                size = excluded.size,
+                is_text = excluded.is_text
+            """,
+            [
+                (branch_name, item.path, item.blob_id, item.mode, item.size, int(item.is_text))
+                for item in files
+            ],
+        )
+
+    def branch_tip_files(self, branch_name: str) -> list[FileSnapshot]:
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT path, mode, blob_id, size, is_text
+                FROM branch_tip_files
+                WHERE branch_name = ?
+                ORDER BY path
+                """,
+                (branch_name,),
+            ).fetchall()
+            return _rows_to_snapshots(rows)
+        finally:
+            conn.close()
+
+    def replace_branch_tip(self, branch_name: str, files: list[FileSnapshot]) -> None:
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN")
+            conn.execute("DELETE FROM branch_tip_files WHERE branch_name = ?", (branch_name,))
+            self._apply_branch_tip_changes(conn, branch_name, files, set(), replace_all=False)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def commit_manifest_ready(self, commit_id: str) -> bool:
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT ready FROM commit_manifest_state WHERE commit_id = ?",
+                (commit_id,),
+            ).fetchone()
+            return row is not None and bool(row["ready"])
+        finally:
+            conn.close()
+
+    def commit_changes(self, commit_id: str) -> tuple[list[FileSnapshot], set[str]]:
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT path, mode, blob_id, size, is_text, deleted
+                FROM commit_changes
+                WHERE commit_id = ?
+                ORDER BY path
+                """,
+                (commit_id,),
+            ).fetchall()
+            files: list[FileSnapshot] = []
+            deleted_paths: set[str] = set()
+            for row in rows:
+                if row["deleted"]:
+                    deleted_paths.add(row["path"])
+                    continue
+                files.append(
+                    FileSnapshot(
+                        path=row["path"],
+                        mode=row["mode"],
+                        blob_id=row["blob_id"],
+                        size=row["size"],
+                        is_text=bool(row["is_text"]),
+                    )
+                )
+            return files, deleted_paths
+        finally:
+            conn.close()
+
+    def store_commit_manifest(self, commit_id: str, files: list[FileSnapshot]) -> None:
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN")
+            conn.execute("DELETE FROM commit_files WHERE commit_id = ?", (commit_id,))
+            if files:
+                conn.executemany(
                     """
                     INSERT INTO commit_files(commit_id, path, blob_id, mode, size, is_text)
                     VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (commit.commit_id, item.path, item.blob_id, item.mode, item.size, int(item.is_text)),
+                    [
+                        (commit_id, item.path, item.blob_id, item.mode, item.size, int(item.is_text))
+                        for item in files
+                    ],
                 )
-                conn.execute(
-                    """
-                    INSERT INTO blobs(blob_id, size, is_text, indexed_content)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(blob_id) DO NOTHING
-                    """,
-                    (item.blob_id, item.size, int(item.is_text), int(item.blob_id in blob_contents)),
-                )
-            for blob_id, content in blob_contents.items():
-                exists = conn.execute("SELECT 1 FROM blob_fts WHERE blob_id = ?", (blob_id,)).fetchone()
-                if exists is None:
-                    conn.execute("INSERT INTO blob_fts(blob_id, content) VALUES (?, ?)", (blob_id, content))
-            if branch_name is not None:
-                conn.execute("UPDATE refs SET commit_id = ? WHERE name = ?", (commit.commit_id, branch_name))
+            conn.execute(
+                """
+                INSERT INTO commit_manifest_state(commit_id, ready)
+                VALUES (?, 1)
+                ON CONFLICT(commit_id) DO UPDATE SET ready = 1
+                """,
+                (commit_id,),
+            )
             conn.commit()
         except Exception:
             conn.rollback()
@@ -315,16 +599,7 @@ class MetadataIndex:
                 """,
                 (commit_id,),
             ).fetchall()
-            return [
-                FileSnapshot(
-                    path=row["path"],
-                    mode=row["mode"],
-                    blob_id=row["blob_id"],
-                    size=row["size"],
-                    is_text=bool(row["is_text"]),
-                )
-                for row in rows
-            ]
+            return _rows_to_snapshots(rows)
         finally:
             conn.close()
 
@@ -334,25 +609,44 @@ class MetadataIndex:
             if branch_names:
                 placeholders = ",".join("?" for _ in branch_names)
                 rows = conn.execute(
-                    f"SELECT name, commit_id FROM refs WHERE name IN ({placeholders})",
+                    f"""
+                    WITH RECURSIVE reachable(name, commit_id) AS (
+                        SELECT name, commit_id
+                        FROM refs
+                        WHERE name IN ({placeholders}) AND commit_id IS NOT NULL
+                        UNION
+                        SELECT reachable.name, commits.parent_id
+                        FROM reachable
+                        JOIN commits ON commits.commit_id = reachable.commit_id
+                        WHERE commits.parent_id IS NOT NULL
+                    )
+                    SELECT name, commit_id
+                    FROM reachable
+                    ORDER BY name, commit_id
+                    """,
                     tuple(branch_names),
                 ).fetchall()
             else:
-                rows = conn.execute("SELECT name, commit_id FROM refs").fetchall()
+                rows = conn.execute(
+                    """
+                    WITH RECURSIVE reachable(name, commit_id) AS (
+                        SELECT name, commit_id
+                        FROM refs
+                        WHERE commit_id IS NOT NULL
+                        UNION
+                        SELECT reachable.name, commits.parent_id
+                        FROM reachable
+                        JOIN commits ON commits.commit_id = reachable.commit_id
+                        WHERE commits.parent_id IS NOT NULL
+                    )
+                    SELECT name, commit_id
+                    FROM reachable
+                    ORDER BY name, commit_id
+                    """
+                ).fetchall()
             commits: dict[str, set[str]] = {}
             for row in rows:
-                name = row["name"]
-                commit_id = row["commit_id"]
-                seen: set[str] = set()
-                current = commit_id
-                while current and current not in seen:
-                    seen.add(current)
-                    parent = conn.execute(
-                        "SELECT parent_id FROM commits WHERE commit_id = ?",
-                        (current,),
-                    ).fetchone()
-                    current = None if parent is None else parent["parent_id"]
-                commits[name] = seen
+                commits.setdefault(row["name"], set()).add(row["commit_id"])
             return commits
         finally:
             conn.close()
@@ -536,3 +830,20 @@ class MetadataIndex:
             return filtered[:limit]
         finally:
             conn.close()
+
+
+def _chunked(values: list[str], size: int) -> list[list[str]]:
+    return [values[index : index + size] for index in range(0, len(values), size)]
+
+
+def _rows_to_snapshots(rows: list[sqlite3.Row]) -> list[FileSnapshot]:
+    return [
+        FileSnapshot(
+            path=row["path"],
+            mode=row["mode"],
+            blob_id=row["blob_id"],
+            size=row["size"],
+            is_text=bool(row["is_text"]),
+        )
+        for row in rows
+    ]

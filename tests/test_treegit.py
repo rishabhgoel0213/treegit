@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -7,6 +8,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -24,6 +26,7 @@ from treegit.errors import (  # noqa: E402
     MetricNotFoundError,
     UnsupportedFileError,
 )
+from treegit.mcts import MCTSEngine  # noqa: E402
 from treegit.hashing import object_id  # noqa: E402
 from treegit.models import TreeEntry  # noqa: E402
 from treegit.objects import parse_tree, serialize_commit, serialize_tree  # noqa: E402
@@ -75,6 +78,14 @@ class TreeGitTestCase(unittest.TestCase):
             capture_output=True,
             check=False,
         )
+
+    def read_scan_cache_blob_id(self, cache_path: Path, relative_path: str) -> str | None:
+        conn = sqlite3.connect(cache_path)
+        try:
+            row = conn.execute("SELECT blob_id FROM files WHERE path = ?", (relative_path,)).fetchone()
+            return None if row is None else row[0]
+        finally:
+            conn.close()
 
 
 class ObjectModelTests(TreeGitTestCase):
@@ -265,6 +276,7 @@ class RepositoryIntegrationTests(TreeGitTestCase):
         repo.create_branch("backup")
         blob_id = repo._file_map_for_commit(first_commit)["tracked.txt"].blob_id
         repo.store.path_for(blob_id).unlink()
+        self.write_text("tracked.txt", "changed before checkout\n")
         with self.assertRaises(InvalidObjectError):
             repo.checkout("backup", force=True)
 
@@ -274,6 +286,158 @@ class RepositoryIntegrationTests(TreeGitTestCase):
             with self.assertRaises(RuntimeError):
                 repo.commit("interrupted")
         self.assertEqual(repo.head_commit_id(), stable_head)
+
+    def test_no_op_commit_reuses_cached_blobs_without_rereading_files(self) -> None:
+        repo = self.init_repo()
+        self.write_text("tracked.txt", "stable\n")
+        repo.commit("first")
+
+        with mock.patch("treegit.working_tree.read_working_file_raw", side_effect=AssertionError("scan reread")), \
+            mock.patch("treegit.repository.read_working_file_raw", side_effect=AssertionError("commit reread")):
+            repo.commit("second")
+
+    def test_one_file_change_only_rereads_that_path(self) -> None:
+        repo = self.init_repo()
+        self.write_text("changed.txt", "v1\n")
+        self.write_text("stable.txt", "stable\n")
+        repo.commit("first")
+
+        self.write_text("changed.txt", "v2\n")
+
+        original_reader = sys.modules["treegit.working_tree"].read_working_file_raw
+        reread_paths: list[str] = []
+
+        def record_reread(path: Path, relative: str, stat_result: os.stat_result | None = None) -> bytes:
+            reread_paths.append(relative)
+            return original_reader(path, relative, stat_result)
+
+        with mock.patch("treegit.working_tree.read_working_file_raw", side_effect=record_reread), \
+            mock.patch("treegit.repository.read_working_file_raw", side_effect=AssertionError("unexpected commit reread")):
+            repo.commit("second")
+
+        self.assertEqual(reread_paths, ["changed.txt"])
+
+    def test_diff_reads_cached_added_file_contents_when_raw_bytes_are_elided(self) -> None:
+        repo = self.init_repo()
+        self.write_text("draft.txt", "draft\n")
+
+        repo.status()
+        cached_files = repo._scan_working_tree()
+        self.assertIsNone(cached_files["draft.txt"].raw)
+
+        diff_output = repo.diff()
+        self.assertIn("+draft", diff_output)
+
+    def test_noop_diff_avoids_blob_reads_for_identical_files(self) -> None:
+        repo = self.init_repo()
+        self.write_text("tracked.txt", "stable\n")
+        repo.commit("first")
+        repo.status()
+
+        with mock.patch("treegit.working_tree.read_working_file_raw", side_effect=AssertionError("scan reread")), \
+            mock.patch("treegit.repository.read_working_file_raw", side_effect=AssertionError("blob reread")), \
+            mock.patch.object(repo.store, "read_object", side_effect=AssertionError("store read")):
+            self.assertEqual(repo.diff(), "")
+
+    def test_sparse_checkout_only_reads_changed_blobs(self) -> None:
+        repo = self.init_repo()
+        self.write_text("changed.txt", "root\n")
+        self.write_text("stable.txt", "shared\n")
+        repo.commit("root base")
+        repo.create_branch("feature")
+
+        repo.checkout("feature", force=True)
+        self.write_text("changed.txt", "feature\n")
+        repo.commit("feature work")
+
+        repo.checkout("root", force=True)
+
+        original_reader = repo.store.read_object
+        read_blob_ids: list[str] = []
+
+        def record_read(blob_id: str) -> tuple[str, bytes]:
+            read_blob_ids.append(blob_id)
+            return original_reader(blob_id)
+
+        with mock.patch.object(repo.store, "read_object", side_effect=record_read):
+            repo.checkout("feature", force=True)
+
+        self.assertEqual(len(read_blob_ids), 1)
+
+    def test_commit_manifests_materialize_lazily_for_history_queries(self) -> None:
+        repo = self.init_repo()
+        self.write_text("tracked.txt", "v1\n")
+        first_commit = repo.commit("first")
+
+        self.write_text("tracked.txt", "v2\n")
+        second_commit = repo.commit("second")
+
+        conn = repo.index.connect()
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) AS count FROM commit_files WHERE commit_id = ?",
+                (second_commit,),
+            ).fetchone()
+            self.assertEqual(count["count"], 0)
+        finally:
+            conn.close()
+
+        diff_output = repo.diff(first_commit, second_commit)
+        self.assertIn("+v2", diff_output)
+
+        conn = repo.index.connect()
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) AS count FROM commit_files WHERE commit_id = ?",
+                (second_commit,),
+            ).fetchone()
+            self.assertGreater(count["count"], 0)
+        finally:
+            conn.close()
+
+    def test_branch_tip_files_track_branch_heads(self) -> None:
+        repo = self.init_repo()
+        self.write_text("tracked.txt", "root\n")
+        root_commit = repo.commit("root base")
+        root_blob_id = repo._head_file_map()["tracked.txt"].blob_id
+
+        repo.create_branch("feature")
+
+        conn = repo.index.connect()
+        try:
+            root_row = conn.execute(
+                "SELECT blob_id FROM branch_tip_files WHERE branch_name = ? AND path = ?",
+                ("root", "tracked.txt"),
+            ).fetchone()
+            feature_row = conn.execute(
+                "SELECT blob_id FROM branch_tip_files WHERE branch_name = ? AND path = ?",
+                ("feature", "tracked.txt"),
+            ).fetchone()
+            self.assertEqual(root_row["blob_id"], root_blob_id)
+            self.assertEqual(feature_row["blob_id"], root_blob_id)
+        finally:
+            conn.close()
+
+        repo.checkout("feature", force=True)
+        self.write_text("tracked.txt", "feature\n")
+        feature_commit = repo.commit("feature work")
+
+        conn = repo.index.connect()
+        try:
+            root_row = conn.execute(
+                "SELECT blob_id FROM branch_tip_files WHERE branch_name = ? AND path = ?",
+                ("root", "tracked.txt"),
+            ).fetchone()
+            feature_row = conn.execute(
+                "SELECT blob_id FROM branch_tip_files WHERE branch_name = ? AND path = ?",
+                ("feature", "tracked.txt"),
+            ).fetchone()
+            self.assertEqual(repo.resolve_revision("root"), root_commit)
+            self.assertEqual(repo.resolve_revision("feature"), feature_commit)
+            self.assertEqual(root_row["blob_id"], root_blob_id)
+            self.assertNotEqual(feature_row["blob_id"], root_blob_id)
+        finally:
+            conn.close()
 
     def test_linked_worktrees_keep_branch_state_local_while_sharing_history(self) -> None:
         main_dir = self.workspace / "main"
@@ -314,6 +478,33 @@ class RepositoryIntegrationTests(TreeGitTestCase):
         self.assertEqual(alt_repo.current_branch(), "alt")
         self.assertEqual((main_dir / "shared.txt").read_text(encoding="utf-8"), "feature\n")
         self.assertEqual((alt_dir / "shared.txt").read_text(encoding="utf-8"), "root\n")
+
+    def test_linked_worktrees_keep_separate_scan_caches(self) -> None:
+        main_dir = self.workspace / "main"
+        feature_dir = self.workspace / "feature"
+
+        repo = self.init_repo_at(main_dir)
+        (main_dir / "shared.txt").write_text("root\n", encoding="utf-8")
+        repo.commit("root base")
+        repo.create_branch("feature")
+        feature_repo = repo.add_worktree(feature_dir, "feature")
+
+        repo.status()
+        feature_repo.status()
+
+        main_cache_path = main_dir / ".treegit" / "scan-cache.db"
+        feature_cache_path = feature_dir / ".treegit" / "scan-cache.db"
+        self.assertTrue(main_cache_path.exists())
+        self.assertTrue(feature_cache_path.exists())
+
+        (feature_dir / "shared.txt").write_text("feature\n", encoding="utf-8")
+        feature_repo.commit("feature work")
+
+        self.assertNotEqual(
+            self.read_scan_cache_blob_id(main_cache_path, "shared.txt"),
+            self.read_scan_cache_blob_id(feature_cache_path, "shared.txt"),
+        )
+        self.assertEqual((main_dir / "shared.txt").read_text(encoding="utf-8"), "root\n")
 
     def test_metrics_define_get_backprop_and_auto_initialize_new_branches(self) -> None:
         repo = self.init_repo()
@@ -385,6 +576,329 @@ class RepositoryIntegrationTests(TreeGitTestCase):
 
 
 class CliSmokeTests(TreeGitTestCase):
+    def build_mcts_fixture(self, repo_root: Path, *, expander_env: dict[str, str] | None = None) -> tuple[Path, Path]:
+        scripts_dir = self.workspace / "scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        counter_path = self.workspace / "objective-counter.txt"
+        expander_path = scripts_dir / "fixture_expander.py"
+        objective_path = scripts_dir / "fixture_objective.py"
+        expander_path.write_text(
+            """#!/usr/bin/env python3
+from pathlib import Path
+import os
+import time
+
+worktree = Path(os.environ["TREEGIT_WORKTREE"])
+branch = os.environ["TREEGIT_BRANCH"]
+parent_branch = os.environ["TREEGIT_PARENT_BRANCH"]
+agent_name = os.environ["TREEGIT_AGENT_NAME"]
+agent_slot = int(os.environ["TREEGIT_AGENT_SLOT"])
+context_dir = worktree / ".treegit" / "mcts"
+current_change = context_dir / "current_change.md"
+template = current_change.read_text(encoding="utf-8")
+if f"Branch: {branch}" not in template or f"Parent: {parent_branch}" not in template:
+    raise SystemExit("missing current change template context")
+barrier_dir_raw = os.environ.get("BARRIER_DIR")
+if barrier_dir_raw:
+    barrier_dir = Path(barrier_dir_raw)
+    barrier_dir.mkdir(parents=True, exist_ok=True)
+    expected = int(os.environ["BARRIER_EXPECTED"])
+    token = barrier_dir / f"agent{agent_slot}.started"
+    token.write_text(branch + "\\n", encoding="utf-8")
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        started = list(barrier_dir.glob("*.started"))
+        if len(started) >= expected:
+            break
+        time.sleep(0.05)
+    else:
+        raise SystemExit("expander barrier timed out")
+if parent_branch != "root":
+    change_history = (context_dir / "change_history.md").read_text(encoding="utf-8")
+    score_history = (context_dir / "score_history.md").read_text(encoding="utf-8")
+    if "Branch: mcts/000002" not in change_history:
+        raise SystemExit("missing parent change history")
+    if "- utility: 2" not in score_history:
+        raise SystemExit("missing parent score history")
+current_change.write_text(
+    f\"\"\"# Current Branch Change Note
+
+Fill in this file before you stop. The search harness will aggregate it into the lineage history for descendants.
+
+Branch: {branch}
+Parent: {parent_branch}
+Agent: {agent_name}
+
+Summary:
+Set fixture utility marker for {branch}.
+Hypothesis:
+Higher slot utility should win UCT tie-breaks in the fixture objective.
+Files Changed:
+- utility.txt
+Validation:
+- not run
+Notes:
+- fixture note
+\"\"\",
+    encoding="utf-8",
+)
+(worktree / "utility.txt").write_text(f"{agent_slot}\\n", encoding="utf-8")
+""",
+            encoding="utf-8",
+        )
+        expander_path.chmod(0o755)
+        objective_path.write_text(
+            """#!/usr/bin/env python3
+from pathlib import Path
+import json
+import os
+
+counter_path = Path(os.environ["COUNTER_PATH"])
+count = 0
+if counter_path.exists():
+    count = int(counter_path.read_text(encoding="utf-8").strip())
+counter_path.write_text(f"{count + 1}\\n", encoding="utf-8")
+worktree = Path(os.environ["TREEGIT_WORKTREE"])
+utility = float((worktree / "utility.txt").read_text(encoding="utf-8").strip())
+print(json.dumps({
+    "success": True,
+    "direction": "maximize",
+    "raw_score": utility,
+    "utility": utility,
+    "metrics": {"utility": utility},
+    "artifacts": {"utility_path": str(worktree / "utility.txt")},
+}))
+""",
+            encoding="utf-8",
+        )
+        objective_path.chmod(0o755)
+        config_path = self.workspace / "mcts-fixture.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "root_branch": "root",
+                    "worktree_root": str((self.workspace / "worktrees").resolve()),
+                    "branch_prefix": "mcts",
+                    "expansion_width": 2,
+                    "selection": {"policy": "uct", "exploration_constant": 0.0},
+                    "expander": {
+                        "command": [sys.executable, str(expander_path)],
+                        "env": {} if expander_env is None else expander_env,
+                        "commit_message_template": "expand {parent_branch} -> {branch}",
+                    },
+                    "objective": {
+                        "id": "fixture-objective",
+                        "version": "v1",
+                        "command": [sys.executable, str(objective_path)],
+                        "env": {"COUNTER_PATH": str(counter_path)},
+                        "default_direction": "maximize",
+                    },
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return config_path, counter_path
+
+    def test_mcts_expanders_run_in_parallel_before_objective_queue(self) -> None:
+        main_dir = self.workspace / "main"
+        repo = self.init_repo_at(main_dir)
+        (main_dir / "seed.txt").write_text("root\n", encoding="utf-8")
+        repo.commit("root base")
+        barrier_dir = self.workspace / "barrier"
+        config_path, counter_path = self.build_mcts_fixture(
+            main_dir,
+            expander_env={
+                "BARRIER_DIR": str(barrier_dir),
+                "BARRIER_EXPECTED": "2",
+            },
+        )
+
+        engine = MCTSEngine(repo)
+        engine.init_search(config_path)
+        first = engine.step()
+
+        self.assertEqual([child.status for child in first.children], ["ready", "ready"])
+        started = sorted(path.name for path in barrier_dir.glob("*.started"))
+        self.assertEqual(started, ["agent1.started", "agent2.started"])
+        self.assertEqual(counter_path.read_text(encoding="utf-8").strip(), "2")
+
+    def test_mcts_engine_two_steps_selects_best_leaf(self) -> None:
+        main_dir = self.workspace / "main"
+        repo = self.init_repo_at(main_dir)
+        (main_dir / "seed.txt").write_text("root\n", encoding="utf-8")
+        repo.commit("root base")
+        config_path, _ = self.build_mcts_fixture(main_dir)
+
+        engine = MCTSEngine(repo)
+        engine.init_search(config_path)
+
+        first = engine.step()
+        self.assertEqual(first.selected_branch, "root")
+        self.assertEqual([child.branch_name for child in first.children], [
+            "mcts/000001",
+            "mcts/000002",
+        ])
+        self.assertEqual([child.utility for child in first.children], [1.0, 2.0])
+        self.assertEqual(
+            [Path(child.worktree_path).name for child in first.children],
+            ["agent1", "agent2"],
+        )
+
+        root_node = engine.store.get_node("root")
+        self.assertIsNotNone(root_node)
+        assert root_node is not None
+        self.assertEqual(root_node.child_count, 2)
+        self.assertEqual(root_node.visit_count, 2)
+        self.assertEqual(root_node.value_sum, 3.0)
+        self.assertEqual(root_node.status, "expanded")
+
+        best_after_first = engine.best()
+        self.assertIsNotNone(best_after_first)
+        assert best_after_first is not None
+        self.assertEqual(best_after_first.branch_name, "mcts/000002")
+        self.assertEqual(best_after_first.last_utility, 2.0)
+        first_note = engine.store.get_note("mcts/000002")
+        self.assertIsNotNone(first_note)
+        assert first_note is not None
+        self.assertIn("Set fixture utility marker for mcts/000002.", first_note.note_text)
+
+        second = engine.step()
+        self.assertEqual(second.selected_branch, "mcts/000002")
+        self.assertEqual([child.branch_name for child in second.children], [
+            "mcts/000003",
+            "mcts/000004",
+        ])
+        self.assertEqual([child.utility for child in second.children], [1.0, None])
+        self.assertEqual([child.status for child in second.children], ["ready", "terminal"])
+
+        selected_node = engine.store.get_node("mcts/000002")
+        self.assertIsNotNone(selected_node)
+        assert selected_node is not None
+        self.assertEqual(selected_node.child_count, 2)
+        self.assertEqual(selected_node.status, "expanded")
+
+        grandchild = engine.store.get_node("mcts/000004")
+        self.assertIsNotNone(grandchild)
+        assert grandchild is not None
+        self.assertEqual(grandchild.parent_branch_name, "mcts/000002")
+        self.assertIsNone(grandchild.last_utility)
+        self.assertEqual(grandchild.status, "terminal")
+        self.assertEqual(grandchild.terminal_reason, "no_changes")
+        second_note = engine.store.get_note("mcts/000003")
+        self.assertIsNotNone(second_note)
+        assert second_note is not None
+        self.assertIn("Set fixture utility marker for mcts/000003.", second_note.note_text)
+
+        status = engine.status()
+        self.assertEqual(status["steps_completed"], 2)
+        self.assertEqual(status["frontier_count"], 2)
+        self.assertEqual(status["best_branch"], "mcts/000002")
+
+    def test_mcts_objective_cache_reuses_equivalent_states_across_search_resets(self) -> None:
+        main_dir = self.workspace / "main"
+        repo = self.init_repo_at(main_dir)
+        (main_dir / "seed.txt").write_text("root\n", encoding="utf-8")
+        repo.commit("root base")
+        config_path, counter_path = self.build_mcts_fixture(main_dir)
+
+        engine = MCTSEngine(repo)
+        engine.init_search(config_path)
+        engine.step()
+        self.assertEqual(counter_path.read_text(encoding="utf-8").strip(), "2")
+
+        engine.init_search(config_path)
+        engine.step()
+        self.assertEqual(counter_path.read_text(encoding="utf-8").strip(), "2")
+
+    def test_cli_mcts_round_trip(self) -> None:
+        main_dir = self.workspace / "main"
+        main_dir.mkdir()
+
+        init = self.run_cli("init", cwd=main_dir)
+        self.assertEqual(init.returncode, 0, init.stderr)
+
+        (main_dir / "seed.txt").write_text("root\n", encoding="utf-8")
+        commit_root = self.run_cli("commit", "-m", "root base", cwd=main_dir)
+        self.assertEqual(commit_root.returncode, 0, commit_root.stderr)
+
+        config_path, _ = self.build_mcts_fixture(main_dir)
+
+        init_run = self.run_cli("mcts", "init", "--config", str(config_path), cwd=main_dir)
+        self.assertEqual(init_run.returncode, 0, init_run.stderr)
+        self.assertEqual(init_run.stdout.strip(), "initialized")
+
+        step = self.run_cli("mcts", "step", cwd=main_dir)
+        self.assertEqual(step.returncode, 0, step.stderr)
+        self.assertIn("selected: root", step.stdout)
+        self.assertIn("mcts/000001", step.stdout)
+        self.assertIn("mcts/000002", step.stdout)
+
+        status = self.run_cli("mcts", "status", cwd=main_dir)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertIn("frontier_count: 2", status.stdout)
+        self.assertIn("best_branch: mcts/000002", status.stdout)
+
+        best = self.run_cli("mcts", "best", cwd=main_dir)
+        self.assertEqual(best.returncode, 0, best.stderr)
+        self.assertIn("mcts/000002", best.stdout)
+
+    def test_cli_mcts_run_background_detaches_and_logs(self) -> None:
+        main_dir = self.workspace / "main"
+        main_dir.mkdir()
+
+        init = self.run_cli("init", cwd=main_dir)
+        self.assertEqual(init.returncode, 0, init.stderr)
+
+        (main_dir / "seed.txt").write_text("root\n", encoding="utf-8")
+        commit_root = self.run_cli("commit", "-m", "root base", cwd=main_dir)
+        self.assertEqual(commit_root.returncode, 0, commit_root.stderr)
+
+        config_path, _ = self.build_mcts_fixture(main_dir)
+        init_run = self.run_cli("mcts", "init", "--config", str(config_path), cwd=main_dir)
+        self.assertEqual(init_run.returncode, 0, init_run.stderr)
+
+        log_path = self.workspace / "background.log"
+        background = self.run_cli(
+            "mcts",
+            "run",
+            "--steps",
+            "1",
+            "--background",
+            "--log-file",
+            str(log_path),
+            cwd=main_dir,
+        )
+        self.assertEqual(background.returncode, 0, background.stderr)
+        self.assertIn("background_pid:", background.stdout)
+        self.assertIn(f"log_file: {log_path.resolve()}", background.stdout)
+
+        deadline = time.time() + 10.0
+        log_text = ""
+        while time.time() < deadline:
+            if log_path.exists():
+                log_text = log_path.read_text(encoding="utf-8")
+                if "steps_executed: 1" in log_text:
+                    break
+            time.sleep(0.1)
+        else:
+            self.fail(f"background log did not show completion in time: {log_text}")
+
+        self.assertIn("selected: root", log_text)
+        self.assertIn("mcts/000001", log_text)
+        self.assertIn("mcts/000002", log_text)
+
+        status = self.run_cli("mcts", "status", cwd=main_dir)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertIn("steps_completed: 1", status.stdout)
+
+        inspect = self.run_cli("mcts", "inspect", "mcts/000002", cwd=main_dir)
+        self.assertEqual(inspect.returncode, 0, inspect.stderr)
+        self.assertIn("branch: mcts/000002", inspect.stdout)
+        self.assertIn("metric.utility: 2.0", inspect.stdout)
+
     def test_cli_round_trip(self) -> None:
         result = self.run_cli("init")
         self.assertEqual(result.returncode, 0, result.stderr)

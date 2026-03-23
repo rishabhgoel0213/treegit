@@ -23,7 +23,7 @@ from treegit.index import MetadataIndex
 from treegit.models import BranchRecord, CommitRecord, FileSnapshot, SearchResult, TreeEntry, WorkingFile
 from treegit.objects import serialize_blob, serialize_commit, serialize_tree
 from treegit.store import ObjectStore
-from treegit.working_tree import scan_working_tree
+from treegit.working_tree import read_working_file_raw, scan_working_tree
 
 
 MAX_PREFIX = 8
@@ -130,14 +130,24 @@ class Repository:
         return self.index.list_branches()
 
     def create_branch(self, name: str) -> None:
+        self.create_branch_from(name=name, parent_name=self.current_branch(), commit_id=self.head_commit_id())
+
+    def create_branch_from(self, name: str, parent_name: str | None, commit_id: str | None) -> None:
         if self.index.has_ref(name):
             raise BranchExistsError(f"branch {name} already exists")
+        if parent_name is not None and self.index.get_branch(parent_name) is None:
+            raise ReferenceResolutionError(f"unknown parent branch {parent_name}")
         self.index.create_branch(
             name=name,
-            commit_id=self.head_commit_id(),
-            parent_name=self.current_branch(),
-            fork_commit_id=self.head_commit_id(),
+            commit_id=commit_id,
+            parent_name=parent_name,
+            fork_commit_id=commit_id,
         )
+        if commit_id is None:
+            self.index.replace_branch_tip(name, [])
+            return
+        source_files = list(self._file_map_for_commit(commit_id).values())
+        self.index.replace_branch_tip(name, source_files)
 
     def define_metric(self, name: str) -> None:
         if self.index.has_metric(name):
@@ -171,9 +181,12 @@ class Repository:
             current_name = branch.parent_name
         self.index.increment_metric_for_branches(name, lineage, value)
 
+    def _scan_working_tree(self) -> dict[str, WorkingFile]:
+        return scan_working_tree(self.root, self.git_dir)
+
     def status(self) -> StatusReport:
         head_files = self._head_file_map()
-        working_files = scan_working_tree(self.root)
+        working_files = self._scan_working_tree()
         if not head_files:
             return StatusReport(added=[], modified=[], deleted=[], untracked=list(working_files))
         added: list[str] = []
@@ -197,9 +210,28 @@ class Repository:
         )
 
     def commit(self, message: str) -> str:
-        working_files = scan_working_tree(self.root)
+        working_files = self._scan_working_tree()
         parent = self.head_commit()
-        tree_id, files = self._write_tree_from_working_files(working_files)
+        parent_files = self._head_file_map()
+        changed_paths, deleted_paths = self._working_tree_changes(working_files, parent_files)
+        if parent is not None and not changed_paths and not deleted_paths:
+            tree_id = parent.root_tree_id
+            files: list[FileSnapshot] = []
+            blob_contents: dict[str, str] = {}
+        else:
+            reusable_parent_paths = set(working_files) - changed_paths
+            changed_text_blobs = {
+                working_files[path].blob_id
+                for path in changed_paths
+                if working_files[path].is_text
+            }
+            unindexed_text_blobs = self.index.unindexed_text_blob_ids(changed_text_blobs)
+            tree_id, files, blob_contents = self._write_tree_from_working_files(
+                working_files,
+                reusable_parent_paths=reusable_parent_paths,
+                unindexed_text_blobs=unindexed_text_blobs,
+                snapshot_paths=changed_paths,
+            )
         created_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         payload = serialize_commit(parent.commit_id if parent else None, tree_id, message, created_at)
         commit_id = self.store.write_object("commit", payload)
@@ -210,12 +242,15 @@ class Repository:
             message=message,
             created_at=created_at,
         )
-        blob_contents: dict[str, str] = {}
-        for item in working_files.values():
-            if item.is_text:
-                blob_contents[item.blob_id] = item.raw.decode("utf-8")
         branch = self.current_branch()
-        self.index.write_commit(commit, files, branch_name=branch, blob_contents=blob_contents)
+        self.index.write_commit(
+            commit,
+            files,
+            branch_name=branch,
+            blob_contents=blob_contents,
+            parent_commit_id=parent.commit_id if parent else None,
+            deleted_paths=deleted_paths,
+        )
         if branch is None:
             self.index.update_head("detached", commit_id)
         return commit_id
@@ -269,11 +304,11 @@ class Repository:
     def diff(self, left: str | None = None, right: str | None = None) -> str:
         if left is None and right is None:
             base = self._head_file_map()
-            compare = scan_working_tree(self.root)
+            compare = self._scan_working_tree()
             return self._render_diff(base, compare)
         if left is not None and right is None:
             base = self._file_map_for_commit(self.resolve_revision(left))
-            compare = scan_working_tree(self.root)
+            compare = self._scan_working_tree()
             return self._render_diff(base, compare)
         assert left is not None and right is not None
         base = self._file_map_for_commit(self.resolve_revision(left))
@@ -300,6 +335,8 @@ class Repository:
                 results["commit"].append(
                     SearchResult("commit", commit.commit_id, None, commit.message, commit.created_at)
                 )
+        if field in {"path", "content", "all"}:
+            self._ensure_commit_manifests(reachable)
         if field in {"path", "all"}:
             for row in self.index.search_paths(query, reachable, path_glob, limit):
                 results["path"].append(
@@ -324,10 +361,14 @@ class Repository:
         return content[start:end].replace("\n", " ")
 
     def _head_file_map(self) -> dict[str, FileSnapshot]:
-        commit_id = self.head_commit_id()
-        if commit_id is None:
-            return {}
-        return self._file_map_for_commit(commit_id)
+        branch_name = self.current_branch()
+        if branch_name is None:
+            commit_id = self.head_commit_id()
+            if commit_id is None:
+                return {}
+            return self._file_map_for_commit(commit_id)
+        commit_id = self.index.get_ref(branch_name)
+        return self._branch_file_map(branch_name, commit_id)
 
     @staticmethod
     def _resolve_common_dir(git_dir: Path) -> Path:
@@ -369,8 +410,8 @@ class Repository:
 
     def _materialize_branch(self, target_branch: BranchRecord) -> str | None:
         target_commit_id = target_branch.commit_id
-        target_files = {} if target_commit_id is None else self._file_map_for_commit(target_commit_id)
-        current_files = scan_working_tree(self.root)
+        target_files = self._branch_file_map(target_branch.name, target_commit_id)
+        current_files = self._scan_working_tree()
         tracked_files = self._head_file_map()
         conflicts = []
         for path in target_files:
@@ -383,12 +424,21 @@ class Repository:
         if conflicts:
             unique_conflicts = ", ".join(sorted(set(conflicts)))
             raise CheckoutConflictError(f"checkout would overwrite untracked files: {unique_conflicts}")
-        self._materialize_tree(target_files, tracked_files)
+        self._materialize_tree(target_files, tracked_files, current_files)
         self._write_branch(target_branch.name)
         return target_commit_id
 
     def _file_map_for_commit(self, commit_id: str) -> dict[str, FileSnapshot]:
+        self._ensure_commit_manifest(commit_id)
         return {item.path: item for item in self.index.files_for_commit(commit_id)}
+
+    def _branch_file_map(self, branch_name: str, commit_id: str | None) -> dict[str, FileSnapshot]:
+        tip_files = self.index.branch_tip_files(branch_name)
+        if tip_files or commit_id is None:
+            return {item.path: item for item in tip_files}
+        files = self._file_map_for_commit(commit_id)
+        self.index.replace_branch_tip(branch_name, list(files.values()))
+        return files
 
     def _can_checkout_branch(self, target_branch: BranchRecord) -> bool:
         current_name = self.current_branch()
@@ -405,21 +455,34 @@ class Repository:
             return True
         return current_branch.parent_name == target_branch.name
 
-    def _write_tree_from_working_files(self, working_files: dict[str, WorkingFile]) -> tuple[str, list[FileSnapshot]]:
+    def _write_tree_from_working_files(
+        self,
+        working_files: dict[str, WorkingFile],
+        reusable_parent_paths: set[str] | None = None,
+        unindexed_text_blobs: set[str] | None = None,
+        snapshot_paths: set[str] | None = None,
+    ) -> tuple[str, list[FileSnapshot], dict[str, str]]:
+        reusable_paths = set() if reusable_parent_paths is None else reusable_parent_paths
+        pending_text_blobs = set() if unindexed_text_blobs is None else unindexed_text_blobs
         directories: dict[tuple[str, ...], list[TreeEntry]] = defaultdict(list)
         all_directories: set[tuple[str, ...]] = {()}
         snapshots: list[FileSnapshot] = []
+        blob_contents: dict[str, str] = {}
         for path, item in working_files.items():
-            blob_id = self.store.write_object("blob", serialize_blob(item.raw))
-            snapshots.append(
-                FileSnapshot(
-                    path=path,
-                    mode=item.mode,
-                    blob_id=blob_id,
-                    size=item.size,
-                    is_text=item.is_text,
+            blob_id, raw = self._ensure_working_blob(item, reuse_cached_blob=path in reusable_paths)
+            if snapshot_paths is None or path in snapshot_paths:
+                snapshots.append(
+                    FileSnapshot(
+                        path=path,
+                        mode=item.mode,
+                        blob_id=blob_id,
+                        size=item.size,
+                        is_text=item.is_text,
+                    )
                 )
-            )
+            if item.is_text and blob_id in pending_text_blobs and blob_id not in blob_contents:
+                payload = raw if raw is not None else self._read_blob_payload(blob_id)
+                blob_contents[blob_id] = payload.decode("utf-8")
             parts = tuple(path.split("/"))
             parent = parts[:-1]
             for size in range(len(parent) + 1):
@@ -442,7 +505,32 @@ class Repository:
                 TreeEntry(name=directory[-1], mode="040000", kind="tree", object_id=tree_id)
             )
         root_tree_id = self._write_tree((), directories.get((), []))
-        return root_tree_id, sorted(snapshots, key=lambda item: item.path)
+        return root_tree_id, sorted(snapshots, key=lambda item: item.path), blob_contents
+
+    def _ensure_working_blob(self, item: WorkingFile, reuse_cached_blob: bool = False) -> tuple[str, bytes | None]:
+        if item.raw is not None:
+            return self.store.write_object("blob", serialize_blob(item.raw)), item.raw
+        if reuse_cached_blob:
+            return item.blob_id, None
+        if self.store.has_object(item.blob_id):
+            return item.blob_id, None
+        raw = read_working_file_raw(self.root / item.path, item.path)
+        return self.store.write_object("blob", serialize_blob(raw)), raw
+
+    def _working_tree_changes(
+        self,
+        working_files: dict[str, WorkingFile],
+        parent_files: dict[str, FileSnapshot],
+    ) -> tuple[set[str], set[str]]:
+        changed_paths = {
+            path
+            for path, item in working_files.items()
+            if (snapshot := parent_files.get(path)) is None
+            or snapshot.blob_id != item.blob_id
+            or snapshot.mode != item.mode
+        }
+        deleted_paths = set(parent_files) - set(working_files)
+        return changed_paths, deleted_paths
 
     def _write_tree(self, directory: tuple[str, ...], entries: list[TreeEntry]) -> str:
         payload = serialize_tree(entries)
@@ -465,6 +553,7 @@ class Repository:
         self,
         target_files: dict[str, FileSnapshot],
         tracked_files: dict[str, FileSnapshot],
+        current_files: dict[str, WorkingFile],
     ) -> None:
         for path in tracked_files:
             if path not in target_files:
@@ -475,6 +564,14 @@ class Repository:
                     absolute.unlink()
                     self._cleanup_empty_parents(absolute.parent)
         for path, snapshot in target_files.items():
+            current = current_files.get(path)
+            if (
+                current is not None
+                and path in tracked_files
+                and current.blob_id == snapshot.blob_id
+                and current.mode == snapshot.mode
+            ):
+                continue
             absolute = self.root / path
             absolute.parent.mkdir(parents=True, exist_ok=True)
             kind, payload = self.store.read_object(snapshot.blob_id)
@@ -515,6 +612,8 @@ class Repository:
             if right_item is None:
                 output.append(self._diff_deleted(path, left_item))
                 continue
+            if left_item.blob_id == right_item.blob_id and left_item.mode == right_item.mode:
+                continue
             left_blob, left_mode, left_text = self._blob_contents(left_item)
             right_blob, right_mode, right_text = self._blob_contents(right_item)
             if left_blob == right_blob and left_mode == right_mode:
@@ -543,10 +642,47 @@ class Repository:
 
     def _blob_contents(self, item: FileSnapshot | WorkingFile) -> tuple[bytes, str, str | None]:
         if isinstance(item, WorkingFile):
-            raw = item.raw
+            if item.raw is not None:
+                raw = item.raw
+            elif self.store.has_object(item.blob_id):
+                raw = self._read_blob_payload(item.blob_id)
+            else:
+                raw = read_working_file_raw(self.root / item.path, item.path)
             mode = item.mode
             return raw, mode, raw.decode("utf-8") if item.is_text else None
-        kind, payload = self.store.read_object(item.blob_id)
-        if kind != "blob":
-            raise InvalidObjectError(f"invalid blob object {item.blob_id}")
+        payload = self._read_blob_payload(item.blob_id)
         return payload, item.mode, payload.decode("utf-8") if item.is_text else None
+
+    def _read_blob_payload(self, blob_id: str) -> bytes:
+        kind, payload = self.store.read_object(blob_id)
+        if kind != "blob":
+            raise InvalidObjectError(f"invalid blob object {blob_id}")
+        return payload
+
+    def _ensure_commit_manifests(self, commit_ids: set[str]) -> None:
+        ensured: set[str] = set()
+        for commit_id in sorted(commit_ids):
+            self._ensure_commit_manifest(commit_id, ensured)
+
+    def _ensure_commit_manifest(self, commit_id: str, ensured: set[str] | None = None) -> None:
+        if ensured is not None and commit_id in ensured:
+            return
+        if self.index.commit_manifest_ready(commit_id):
+            if ensured is not None:
+                ensured.add(commit_id)
+            return
+        commit = self.index.get_commit(commit_id)
+        if commit is None:
+            raise InvalidObjectError(f"missing commit metadata for {commit_id}")
+        manifest: dict[str, FileSnapshot] = {}
+        if commit.parent_id is not None:
+            self._ensure_commit_manifest(commit.parent_id, ensured)
+            manifest = {item.path: item for item in self.index.files_for_commit(commit.parent_id)}
+        changed_files, deleted_paths = self.index.commit_changes(commit_id)
+        for path in deleted_paths:
+            manifest.pop(path, None)
+        for item in changed_files:
+            manifest[item.path] = item
+        self.index.store_commit_manifest(commit_id, sorted(manifest.values(), key=lambda item: item.path))
+        if ensured is not None:
+            ensured.add(commit_id)

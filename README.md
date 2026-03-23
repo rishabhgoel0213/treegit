@@ -24,6 +24,7 @@ It is intentionally simpler than Git:
 - `treegit metric get <name>` reads the metric for the current branch.
 - `treegit metric backprop <name> <value>` increments the metric on the current branch and all of its parents.
 - `treegit branch` prints the branch tree.
+- `treegit mcts ...` runs a synchronous MCTS loop over branches using pluggable expander and objective commands.
 
 There is no `treegit add`.
 
@@ -40,6 +41,40 @@ If you want a shell shortcut:
 
 ```bash
 alias treegit='PYTHONPATH=/home/rishabh/tree-git/src python3 -m treegit'
+```
+
+## Benchmarking
+
+Run the synthetic large-repo benchmark from the repository root:
+
+```bash
+python3 benchmarks/commit_perf.py --files 5000 --warmups 2 --repeats 7
+```
+
+To focus on a subset of hot paths:
+
+```bash
+python3 benchmarks/commit_perf.py --files 5000 \
+  --scenario warm_status \
+  --scenario warm_noop_commit \
+  --scenario warm_one_change_commit \
+  --scenario checkout_root \
+  --scenario checkout_feature \
+  --scenario diff_noop
+```
+
+To compare a run against a saved baseline:
+
+```bash
+python3 benchmarks/commit_perf.py --files 5000 \
+  --compare /path/to/baseline.json \
+  --fail-on-regression-pct 10
+```
+
+To inspect a hot path with `cProfile`:
+
+```bash
+python3 benchmarks/commit_perf.py --files 5000 --profile diff_noop
 ```
 
 ## Basic workflow
@@ -85,7 +120,26 @@ treegit search <query> [--field content|path|commit|branch|all] [--branch name] 
 treegit metric define <name>
 treegit metric get <name>
 treegit metric backprop <name> <value>
+treegit mcts init --config /path/to/config.json [--run-id RUN]
+treegit mcts step <run_id>
+treegit mcts run <run_id> [--steps N]
+treegit mcts status <run_id>
+treegit mcts best <run_id>
 ```
+
+## MCTS Config
+
+The MCTS entrypoint is command-based and objective-agnostic. The config file is JSON and must define:
+
+- `root_branch`
+- `worktree_root`
+- `branch_prefix`
+- `expansion_width`
+- `selection.policy` and `selection.exploration_constant`
+- `expander.command`
+- `objective.id`, `objective.version`, and `objective.command`
+
+The expander command runs in a fresh worktree for each child branch. It is expected to edit files and exit; TreeGit commits the resulting change. The objective command then runs in that worktree and must print a JSON object containing a scalar `utility` or a `raw_score` plus `direction`.
 
 ## Notes
 
