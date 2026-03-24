@@ -668,6 +668,24 @@ class MCTSStore:
             conn.close()
         return None if row is None else _row_to_node(row)
 
+    def list_worktree_paths(self) -> list[str]:
+        conn = self.index.connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT worktree_path
+                FROM mcts_nodes
+                WHERE run_id = ?
+                  AND worktree_path IS NOT NULL
+                  AND worktree_path != ''
+                ORDER BY worktree_path
+                """,
+                (ACTIVE_SEARCH_ID,),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [str(row["worktree_path"]) for row in rows]
+
     def list_nodes(self) -> list[SearchNodeRecord]:
         conn = self.index.connect()
         try:

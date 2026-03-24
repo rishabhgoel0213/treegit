@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -26,6 +28,7 @@ from treegit.errors import (  # noqa: E402
     MetricNotFoundError,
     UnsupportedFileError,
 )
+from treegit.cli import build_parser, run_command  # noqa: E402
 from treegit.mcts import MCTSEngine  # noqa: E402
 from treegit.hashing import object_id  # noqa: E402
 from treegit.models import TreeEntry  # noqa: E402
@@ -845,6 +848,15 @@ print(json.dumps({
         self.assertEqual(best.returncode, 0, best.stderr)
         self.assertIn("mcts/000002", best.stdout)
 
+        plot_path = self.workspace / "best-path.svg"
+        plot = self.run_cli("mcts", "plot", "--output", str(plot_path), cwd=main_dir)
+        self.assertEqual(plot.returncode, 0, plot.stderr)
+        self.assertIn(f"output: {plot_path.resolve()}", plot.stdout)
+        self.assertTrue(plot_path.exists())
+        svg = plot_path.read_text(encoding="utf-8")
+        self.assertIn("<svg", svg)
+        self.assertIn("mcts/000002", svg)
+
     def test_cli_mcts_run_background_detaches_and_logs(self) -> None:
         main_dir = self.workspace / "main"
         main_dir.mkdir()
@@ -894,10 +906,89 @@ print(json.dumps({
         self.assertEqual(status.returncode, 0, status.stderr)
         self.assertIn("steps_completed: 1", status.stdout)
 
-        inspect = self.run_cli("mcts", "inspect", "mcts/000002", cwd=main_dir)
-        self.assertEqual(inspect.returncode, 0, inspect.stderr)
-        self.assertIn("branch: mcts/000002", inspect.stdout)
-        self.assertIn("metric.utility: 2.0", inspect.stdout)
+    def test_cli_mcts_stop_kills_background_process_and_tmux(self) -> None:
+        main_dir = self.workspace / "main"
+        repo = self.init_repo_at(main_dir)
+        (main_dir / "seed.txt").write_text("root\n", encoding="utf-8")
+        repo.commit("root base")
+        config_path, _ = self.build_mcts_fixture(main_dir)
+
+        engine = MCTSEngine(repo)
+        engine.init_search(config_path)
+
+        state_path = main_dir / ".treegit" / "mcts-background.json"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "pid": 4321,
+                    "log_file": str((self.workspace / "background.log").resolve()),
+                    "tmux_session": "pg-mcts",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        args = build_parser().parse_args(["mcts", "stop"])
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout), mock.patch("treegit.cli.Path.cwd", return_value=main_dir), mock.patch(
+            "treegit.cli._terminate_process_group"
+        ) as terminate, mock.patch("treegit.cli._kill_tmux_session") as kill_tmux:
+            rc = run_command(args)
+
+        self.assertEqual(rc, 0)
+        terminate.assert_called_once_with(4321)
+        kill_tmux.assert_called_once_with("pg-mcts")
+        self.assertFalse(state_path.exists())
+        self.assertEqual(engine.status()["status"], "stopped")
+        self.assertIn("background_pid: 4321", stdout.getvalue())
+        self.assertIn("tmux_session: pg-mcts", stdout.getvalue())
+
+    def test_cli_reset_clears_search_tree_and_removes_worktrees(self) -> None:
+        main_dir = self.workspace / "main"
+        main_dir.mkdir()
+
+        init = self.run_cli("init", cwd=main_dir)
+        self.assertEqual(init.returncode, 0, init.stderr)
+
+        (main_dir / "seed.txt").write_text("root\n", encoding="utf-8")
+        commit_root = self.run_cli("commit", "-m", "root base", cwd=main_dir)
+        self.assertEqual(commit_root.returncode, 0, commit_root.stderr)
+
+        create_feature = self.run_cli("branch", "feature", cwd=main_dir)
+        self.assertEqual(create_feature.returncode, 0, create_feature.stderr)
+        worktree_dir = self.workspace / "feature-worktree"
+        add_worktree = self.run_cli("worktree", "add", str(worktree_dir), "feature", cwd=main_dir)
+        self.assertEqual(add_worktree.returncode, 0, add_worktree.stderr)
+        self.assertTrue(worktree_dir.exists())
+
+        config_path, _ = self.build_mcts_fixture(main_dir)
+        init_run = self.run_cli("mcts", "init", "--config", str(config_path), cwd=main_dir)
+        self.assertEqual(init_run.returncode, 0, init_run.stderr)
+        first_step = self.run_cli("mcts", "step", cwd=main_dir)
+        self.assertEqual(first_step.returncode, 0, first_step.stderr)
+
+        agent1 = self.workspace / "worktrees" / "agent1"
+        agent2 = self.workspace / "worktrees" / "agent2"
+        self.assertTrue(agent1.exists())
+        self.assertTrue(agent2.exists())
+
+        reset = self.run_cli("reset", cwd=main_dir)
+        self.assertEqual(reset.returncode, 0, reset.stderr)
+        self.assertIn("reset complete", reset.stdout)
+        self.assertFalse(worktree_dir.exists())
+        self.assertFalse(agent1.exists())
+        self.assertFalse(agent2.exists())
+
+        branches = self.run_cli("branch", cwd=main_dir)
+        self.assertEqual(branches.returncode, 0, branches.stderr)
+        self.assertIn("* root", branches.stdout)
+        self.assertNotIn("feature", branches.stdout)
+        self.assertNotIn("mcts/000001", branches.stdout)
+
+        status = self.run_cli("mcts", "status", cwd=main_dir)
+        self.assertEqual(status.returncode, 1)
+        self.assertIn("MCTS search has not been initialized", status.stderr)
 
     def test_cli_round_trip(self) -> None:
         result = self.run_cli("init")

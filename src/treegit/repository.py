@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import shutil
 
 from treegit.diffing import binary_diff_summary, render_text_diff
 from treegit.errors import (
@@ -290,6 +291,7 @@ class Repository:
             repo = Repository(target_root, git_dir=target_git_dir, common_dir=self._resolve_common_dir(target_git_dir))
             if repo.common_dir.resolve() != self.common_dir.resolve():
                 raise RepoExistsError(f"worktree path belongs to a different repository: {target_root}")
+            self.index.register_worktree(str(target_root), str(self.common_dir.resolve()))
             repo._switch_branch(target_branch, force=False, require_navigation=False)
             return repo
         if any(target_root.iterdir()):
@@ -299,7 +301,32 @@ class Repository:
         repo = Repository(target_root, git_dir=target_git_dir, common_dir=self.common_dir)
         repo._write_branch(target_branch.name)
         repo._materialize_branch(target_branch)
+        self.index.register_worktree(str(target_root), str(self.common_dir.resolve()))
         return repo
+
+    def primary_repository(self) -> "Repository":
+        return Repository(self.common_dir.parent, git_dir=self.common_dir, common_dir=self.common_dir)
+
+    def delete_all_non_root_branches(self) -> None:
+        current = self.current_branch()
+        if current != "root":
+            self.checkout("root", force=True)
+        self.index.delete_all_non_root_branches()
+
+    def registered_worktrees(self) -> list[Path]:
+        paths = self.index.list_worktrees(str(self.common_dir.resolve()))
+        return [Path(raw).resolve() for raw in paths]
+
+    def unregister_worktree(self, path: Path) -> None:
+        self.index.unregister_worktree(str(path.resolve()))
+
+    def remove_worktree(self, path: Path) -> None:
+        target = path.resolve()
+        if target == self.root.resolve():
+            raise RepoExistsError("refusing to remove the primary repository root")
+        if target.exists():
+            shutil.rmtree(target)
+        self.unregister_worktree(target)
 
     def diff(self, left: str | None = None, right: str | None = None) -> str:
         if left is None and right is None:

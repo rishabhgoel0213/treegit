@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from html import escape
+import json
 import os
 from pathlib import Path
+import signal
+import shutil
 import subprocess
 import sys
 import time
 
-from treegit.errors import TreeGitError
+from treegit.errors import MCTSRunNotFoundError, TreeGitError
 from treegit.mcts import MCTSEngine
 from treegit.repository import Repository
 
@@ -18,6 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("init")
+    subparsers.add_parser("reset")
     subparsers.add_parser("status")
 
     commit_parser = subparsers.add_parser("commit")
@@ -75,13 +80,20 @@ def build_parser() -> argparse.ArgumentParser:
     mcts_run_parser.add_argument("--steps", type=int, default=1)
     mcts_run_parser.add_argument("--background", action="store_true")
     mcts_run_parser.add_argument("--log-file")
+    mcts_run_parser.add_argument("--background-child", action="store_true", help=argparse.SUPPRESS)
+    mcts_run_parser.add_argument("--background-state-file", help=argparse.SUPPRESS)
 
     mcts_subparsers.add_parser("status")
 
     mcts_subparsers.add_parser("best")
 
+    mcts_subparsers.add_parser("stop")
+
     mcts_inspect_parser = mcts_subparsers.add_parser("inspect")
     mcts_inspect_parser.add_argument("branch")
+
+    mcts_plot_parser = mcts_subparsers.add_parser("plot")
+    mcts_plot_parser.add_argument("--output")
 
     return parser
 
@@ -102,6 +114,28 @@ def run_command(args: argparse.Namespace) -> int:
         print(f"Initialized empty TreeGit repository in {repo.git_dir}")
         return 0
     repo = Repository.discover(cwd)
+    primary_repo = repo.primary_repository()
+    if args.command == "reset":
+        if repo.root.resolve() != primary_repo.root.resolve():
+            raise TreeGitError("reset must be run from the primary repository")
+        stopped = _stop_active_mcts(primary_repo)
+        engine = MCTSEngine(primary_repo)
+        engine.store.reset_search()
+        worktree_paths = _linked_worktree_paths(primary_repo, engine)
+        primary_repo.delete_all_non_root_branches()
+        for worktree_path in worktree_paths:
+            if worktree_path == primary_repo.root.resolve():
+                continue
+            if worktree_path.exists():
+                shutil.rmtree(worktree_path)
+            primary_repo.unregister_worktree(worktree_path)
+        print("reset complete")
+        print(f"worktrees_removed: {len(worktree_paths)}")
+        if stopped["background_pid"] is not None:
+            print(f"background_pid: {stopped['background_pid']}")
+        if stopped["tmux_session"] is not None:
+            print(f"tmux_session: {stopped['tmux_session']}")
+        return 0
     if args.command == "status":
         report = repo.status()
         if not report.is_dirty():
@@ -193,7 +227,7 @@ def run_command(args: argparse.Namespace) -> int:
             repo.backprop_metric(args.name, args.value)
             return 0
     if args.command == "mcts":
-        engine = MCTSEngine(repo)
+        engine = MCTSEngine(primary_repo)
         if args.mcts_command == "init":
             engine.init_search(Path(args.config))
             print("initialized")
@@ -212,17 +246,38 @@ def run_command(args: argparse.Namespace) -> int:
                 print(f"best_branch: {result.best_branch}")
             return 0
         if args.mcts_command == "run":
-            if args.background:
-                log_path, pid = _spawn_background_mcts_run(repo, steps=args.steps, log_file=args.log_file)
+            if args.background and not args.background_child:
+                log_path, pid = _spawn_background_mcts_run(primary_repo, steps=args.steps, log_file=args.log_file)
                 print(f"background_pid: {pid}")
                 print(f"log_file: {log_path}")
                 return 0
-            results = _run_mcts_steps(engine, args.steps)
+            if args.background_child:
+                _write_background_state(
+                    primary_repo,
+                    pid=os.getpid(),
+                    log_path=_resolve_log_path(primary_repo, args.log_file),
+                    tmux_session_name=_configured_tmux_session_name(engine),
+                )
+            try:
+                results = _run_mcts_steps(engine, args.steps)
+            finally:
+                if args.background_child:
+                    _clear_background_state(primary_repo, expected_pid=os.getpid())
             print(f"steps_executed: {len(results)}", flush=True)
             if results:
                 print(f"last_selected: {results[-1].selected_branch}", flush=True)
                 if results[-1].best_branch is not None:
                     print(f"best_branch: {results[-1].best_branch}", flush=True)
+            return 0
+        if args.mcts_command == "stop":
+            stopped = _stop_active_mcts(primary_repo)
+            if stopped["background_pid"] is None and stopped["tmux_session"] is None:
+                print("idle")
+            else:
+                if stopped["background_pid"] is not None:
+                    print(f"background_pid: {stopped['background_pid']}")
+                if stopped["tmux_session"] is not None:
+                    print(f"tmux_session: {stopped['tmux_session']}")
             return 0
         if args.mcts_command == "status":
             status = engine.status()
@@ -267,6 +322,12 @@ def run_command(args: argparse.Namespace) -> int:
             for key in sorted(evaluation.result.artifacts):
                 print(f"artifact.{key}: {evaluation.result.artifacts[key]}")
             return 0
+        if args.mcts_command == "plot":
+            output_path, best_branch, point_count = _write_best_path_plot(primary_repo, engine, args.output)
+            print(f"output: {output_path}")
+            print(f"best_branch: {best_branch}")
+            print(f"points: {point_count}")
+            return 0
     return 0
 
 
@@ -296,7 +357,21 @@ def _run_mcts_steps(engine: MCTSEngine, steps: int) -> list:
 def _spawn_background_mcts_run(repo: Repository, *, steps: int, log_file: str | None) -> tuple[Path, int]:
     log_path = _resolve_log_path(repo, log_file)
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    command = [sys.executable, "-m", "treegit", "mcts", "run", "--steps", str(steps)]
+    state_path = _background_state_path(repo)
+    command = [
+        sys.executable,
+        "-m",
+        "treegit",
+        "mcts",
+        "run",
+        "--steps",
+        str(steps),
+        "--background-child",
+        "--background-state-file",
+        str(state_path),
+    ]
+    if log_file is not None:
+        command.extend(["--log-file", str(log_path)])
     env = dict(os.environ)
     existing_pythonpath = env.get("PYTHONPATH")
     source_root = str(Path(__file__).resolve().parents[1])
@@ -320,6 +395,12 @@ def _spawn_background_mcts_run(repo: Repository, *, steps: int, log_file: str | 
             start_new_session=True,
             close_fds=True,
         )
+    _write_background_state(
+        repo,
+        pid=process.pid,
+        log_path=log_path,
+        tmux_session_name=_configured_tmux_session_name(MCTSEngine(repo)),
+    )
     return log_path, process.pid
 
 
@@ -330,3 +411,281 @@ def _resolve_log_path(repo: Repository, raw_path: str | None) -> Path:
     if not path.is_absolute():
         path = (repo.root / path).resolve()
     return path
+
+
+def _background_state_path(repo: Repository) -> Path:
+    return (repo.git_dir / "mcts-background.json").resolve()
+
+
+def _write_background_state(
+    repo: Repository,
+    *,
+    pid: int,
+    log_path: Path,
+    tmux_session_name: str | None,
+) -> None:
+    state_path = _background_state_path(repo)
+    payload = {
+        "pid": pid,
+        "log_file": str(log_path),
+        "tmux_session": tmux_session_name,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    state_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _read_background_state(repo: Repository) -> dict[str, object] | None:
+    state_path = _background_state_path(repo)
+    if not state_path.exists():
+        return None
+    return json.loads(state_path.read_text(encoding="utf-8"))
+
+
+def _clear_background_state(repo: Repository, expected_pid: int | None = None) -> None:
+    state_path = _background_state_path(repo)
+    if not state_path.exists():
+        return
+    if expected_pid is not None:
+        try:
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            state_path.unlink(missing_ok=True)
+            return
+        if int(payload.get("pid", -1)) != expected_pid:
+            return
+    state_path.unlink(missing_ok=True)
+
+
+def _configured_tmux_session_name(engine: MCTSEngine) -> str | None:
+    try:
+        search = engine.store.get_search()
+    except MCTSRunNotFoundError:
+        return None
+    command = list(search.spec.expander.command.command)
+    if "--tmux" not in command:
+        return None
+    prefix = "treegit-codex"
+    if "--tmux-session-prefix" in command:
+        index = command.index("--tmux-session-prefix")
+        if index + 1 < len(command):
+            prefix = command[index + 1]
+    return _sanitize_tmux_name(prefix)
+
+
+def _sanitize_tmux_name(value: str) -> str:
+    safe = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in value)
+    return safe[:80]
+
+
+def _stop_active_mcts(repo: Repository) -> dict[str, int | str | None]:
+    background_pid: int | None = None
+    tmux_session: str | None = None
+    state = _read_background_state(repo)
+    if state is not None:
+        raw_pid = state.get("pid")
+        if isinstance(raw_pid, int):
+            background_pid = raw_pid
+            _terminate_process_group(background_pid)
+        raw_tmux = state.get("tmux_session")
+        if isinstance(raw_tmux, str) and raw_tmux.strip():
+            tmux_session = raw_tmux
+        _clear_background_state(repo)
+
+    engine = MCTSEngine(repo)
+    configured_session = _configured_tmux_session_name(engine)
+    if tmux_session is None:
+        tmux_session = configured_session
+    if tmux_session is not None:
+        _kill_tmux_session(tmux_session)
+    try:
+        engine.store.set_search_status("stopped")
+    except MCTSRunNotFoundError:
+        pass
+    return {
+        "background_pid": background_pid,
+        "tmux_session": tmux_session,
+    }
+
+
+def _terminate_process_group(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if not _process_exists(pid):
+            return
+        time.sleep(0.1)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+
+
+def _process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _kill_tmux_session(session_name: str) -> None:
+    completed = subprocess.run(
+        ["tmux", "kill-session", "-t", session_name],
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if completed.returncode not in {0, 1}:
+        raise TreeGitError(f"failed to kill tmux session {session_name!r}")
+
+
+def _linked_worktree_paths(repo: Repository, engine: MCTSEngine) -> list[Path]:
+    paths: set[Path] = set()
+    for worktree_path in repo.registered_worktrees():
+        paths.add(worktree_path)
+    for raw_path in engine.store.list_worktree_paths():
+        paths.add(Path(raw_path).resolve())
+    search_root = repo.root.parent.resolve()
+    common_dir = repo.common_dir.resolve()
+    for commondir_file in search_root.rglob("commondir"):
+        if commondir_file.parent.name != ".treegit":
+            continue
+        try:
+            raw = commondir_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not raw:
+            continue
+        candidate_common = Path(raw)
+        if not candidate_common.is_absolute():
+            candidate_common = (commondir_file.parent / candidate_common).resolve()
+        else:
+            candidate_common = candidate_common.resolve()
+        if candidate_common != common_dir:
+            continue
+        paths.add(commondir_file.parent.parent.resolve())
+    return sorted(path for path in paths if path != repo.root.resolve())
+
+
+def _write_best_path_plot(repo: Repository, engine: MCTSEngine, raw_output_path: str | None) -> tuple[Path, str, int]:
+    best = engine.best()
+    if best is None or best.last_raw_score is None:
+        raise TreeGitError("no evaluated MCTS branches to plot")
+    nodes = {node.branch_name: node for node in engine.store.list_nodes()}
+    lineage = []
+    current = best
+    while current is not None:
+        if current.last_raw_score is not None:
+            lineage.append(current)
+        current = None if current.parent_branch_name is None else nodes.get(current.parent_branch_name)
+    lineage.reverse()
+    output_path = _resolve_plot_path(repo, raw_output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(_render_best_path_svg(lineage), encoding="utf-8")
+    return output_path, best.branch_name, len(lineage)
+
+
+def _resolve_plot_path(repo: Repository, raw_path: str | None) -> Path:
+    if raw_path is None:
+        return (repo.git_dir / "mcts-best-path.svg").resolve()
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = (repo.root / path).resolve()
+    return path
+
+
+def _render_best_path_svg(lineage) -> str:
+    width = 960
+    height = 540
+    margin_left = 90
+    margin_right = 40
+    margin_top = 60
+    margin_bottom = 110
+    plot_width = width - margin_left - margin_right
+    plot_height = height - margin_top - margin_bottom
+
+    scores = [float(node.last_raw_score) for node in lineage]
+    min_score = min(scores)
+    max_score = max(scores)
+    if min_score == max_score:
+        min_score -= 1.0
+        max_score += 1.0
+    score_span = max_score - min_score
+
+    if len(lineage) == 1:
+        x_positions = [margin_left + plot_width / 2.0]
+    else:
+        x_step = plot_width / float(len(lineage) - 1)
+        x_positions = [margin_left + i * x_step for i in range(len(lineage))]
+
+    def y_for_score(score: float) -> float:
+        normalized = (score - min_score) / score_span
+        return margin_top + normalized * plot_height
+
+    points = [(x, y_for_score(float(node.last_raw_score))) for x, node in zip(x_positions, lineage)]
+    polyline_points = " ".join(f"{x:.2f},{y:.2f}" for x, y in points)
+
+    grid_lines = []
+    tick_labels = []
+    tick_count = 5
+    for index in range(tick_count + 1):
+        ratio = index / tick_count
+        score = min_score + ratio * score_span
+        y = margin_top + ratio * plot_height
+        grid_lines.append(
+            f'<line x1="{margin_left}" y1="{y:.2f}" x2="{width - margin_right}" y2="{y:.2f}" '
+            'stroke="#e5e7eb" stroke-width="1" />'
+        )
+        tick_labels.append(
+            f'<text x="{margin_left - 12}" y="{y + 4:.2f}" text-anchor="end" '
+            'font-family="monospace" font-size="12" fill="#374151">'
+            f"{escape(f'{score:.0f}')}"
+            "</text>"
+        )
+
+    point_elements = []
+    for (x, y), node in zip(points, lineage):
+        score = float(node.last_raw_score)
+        label = node.branch_name
+        point_elements.append(
+            f'<circle cx="{x:.2f}" cy="{y:.2f}" r="4.5" fill="#2563eb" stroke="white" stroke-width="1.5" />'
+        )
+        point_elements.append(
+            f'<text x="{x:.2f}" y="{height - margin_bottom + 24:.2f}" text-anchor="middle" '
+            'font-family="monospace" font-size="11" fill="#111827">'
+            f"{escape(label)}"
+            "</text>"
+        )
+        point_elements.append(
+            f'<text x="{x:.2f}" y="{max(margin_top + 14.0, y - 10.0):.2f}" text-anchor="middle" '
+            'font-family="monospace" font-size="11" fill="#1f2937">'
+            f"{escape(f'{score:.0f}')}"
+            "</text>"
+        )
+
+    title = "Best-Branch Lineage Score History"
+    subtitle = f"Lower is better. Branch count: {len(lineage)}"
+    return "\n".join(
+        [
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+            '<rect width="100%" height="100%" fill="white" />',
+            f'<text x="{margin_left}" y="28" font-family="monospace" font-size="20" fill="#111827">{escape(title)}</text>',
+            f'<text x="{margin_left}" y="48" font-family="monospace" font-size="12" fill="#4b5563">{escape(subtitle)}</text>',
+            *grid_lines,
+            f'<line x1="{margin_left}" y1="{margin_top}" x2="{margin_left}" y2="{height - margin_bottom}" stroke="#111827" stroke-width="1.5" />',
+            f'<line x1="{margin_left}" y1="{height - margin_bottom}" x2="{width - margin_right}" y2="{height - margin_bottom}" stroke="#111827" stroke-width="1.5" />',
+            *tick_labels,
+            f'<polyline fill="none" stroke="#2563eb" stroke-width="2.5" points="{polyline_points}" />',
+            *point_elements,
+            f'<text x="{margin_left}" y="{height - 18}" font-family="monospace" font-size="12" fill="#374151">Lineage order from root child to current best</text>',
+            f'<text transform="translate(18 {margin_top + plot_height / 2:.2f}) rotate(-90)" font-family="monospace" font-size="12" fill="#374151">score</text>',
+            "</svg>",
+            "",
+        ]
+    )

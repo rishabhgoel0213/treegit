@@ -111,6 +111,13 @@ CREATE TABLE IF NOT EXISTS branch_metrics (
 );
 
 CREATE INDEX IF NOT EXISTS branch_metrics_metric_idx ON branch_metrics(metric_name);
+
+CREATE TABLE IF NOT EXISTS worktrees (
+    path TEXT PRIMARY KEY,
+    common_dir TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS worktrees_common_dir_idx ON worktrees(common_dir);
 """
 
 
@@ -289,6 +296,60 @@ class MetadataIndex:
                     (name, metric["name"]),
                 )
             conn.commit()
+        finally:
+            conn.close()
+
+    def delete_all_non_root_branches(self) -> None:
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN")
+            conn.execute("DELETE FROM branch_metrics WHERE branch_name != 'root'")
+            conn.execute("DELETE FROM branch_tip_files WHERE branch_name != 'root'")
+            conn.execute("DELETE FROM branch_fts WHERE name != 'root'")
+            conn.execute("DELETE FROM refs WHERE name != 'root'")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def register_worktree(self, path: str, common_dir: str) -> None:
+        conn = self.connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO worktrees(path, common_dir)
+                VALUES (?, ?)
+                ON CONFLICT(path) DO UPDATE SET common_dir = excluded.common_dir
+                """,
+                (path, common_dir),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def unregister_worktree(self, path: str) -> None:
+        conn = self.connect()
+        try:
+            conn.execute("DELETE FROM worktrees WHERE path = ?", (path,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def list_worktrees(self, common_dir: str) -> list[str]:
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT path
+                FROM worktrees
+                WHERE common_dir = ?
+                ORDER BY path
+                """,
+                (common_dir,),
+            ).fetchall()
+            return [str(row["path"]) for row in rows]
         finally:
             conn.close()
 
