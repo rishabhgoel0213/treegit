@@ -852,10 +852,44 @@ print(json.dumps({
         plot = self.run_cli("mcts", "plot", "--output", str(plot_path), cwd=main_dir)
         self.assertEqual(plot.returncode, 0, plot.stderr)
         self.assertIn(f"output: {plot_path.resolve()}", plot.stdout)
+        self.assertIn("branch: mcts/000002", plot.stdout)
         self.assertTrue(plot_path.exists())
         svg = plot_path.read_text(encoding="utf-8")
         self.assertIn("<svg", svg)
         self.assertIn("mcts/000002", svg)
+
+        utility_plot_path = self.workspace / "best-path-utility.svg"
+        utility_plot = self.run_cli(
+            "mcts",
+            "plot",
+            "--var",
+            "utility",
+            "--output",
+            str(utility_plot_path),
+            cwd=main_dir,
+        )
+        self.assertEqual(utility_plot.returncode, 0, utility_plot.stderr)
+        self.assertIn(f"output: {utility_plot_path.resolve()}", utility_plot.stdout)
+        self.assertIn("var: utility", utility_plot.stdout)
+        utility_svg = utility_plot_path.read_text(encoding="utf-8")
+        self.assertIn("Best-Branch Lineage: mcts/000002 | utility", utility_svg)
+
+        branch_plot_path = self.workspace / "branch-path.svg"
+        branch_plot = self.run_cli(
+            "mcts",
+            "plot",
+            "--branch",
+            "mcts/000001",
+            "--output",
+            str(branch_plot_path),
+            cwd=main_dir,
+        )
+        self.assertEqual(branch_plot.returncode, 0, branch_plot.stderr)
+        self.assertIn(f"output: {branch_plot_path.resolve()}", branch_plot.stdout)
+        self.assertIn("branch: mcts/000001", branch_plot.stdout)
+        branch_svg = branch_plot_path.read_text(encoding="utf-8")
+        self.assertIn("Branch Lineage: mcts/000001 | score", branch_svg)
+        self.assertIn("mcts/000001", branch_svg)
 
     def test_cli_mcts_run_background_detaches_and_logs(self) -> None:
         main_dir = self.workspace / "main"

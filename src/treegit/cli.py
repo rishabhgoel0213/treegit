@@ -94,6 +94,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     mcts_plot_parser = mcts_subparsers.add_parser("plot")
     mcts_plot_parser.add_argument("--output")
+    mcts_plot_parser.add_argument("--var", default="score")
+    mcts_plot_parser.add_argument("--branch")
 
     return parser
 
@@ -323,9 +325,16 @@ def run_command(args: argparse.Namespace) -> int:
                 print(f"artifact.{key}: {evaluation.result.artifacts[key]}")
             return 0
         if args.mcts_command == "plot":
-            output_path, best_branch, point_count = _write_best_path_plot(primary_repo, engine, args.output)
+            output_path, plotted_branch, point_count = _write_lineage_plot(
+                primary_repo,
+                engine,
+                args.output,
+                args.var,
+                args.branch,
+            )
             print(f"output: {output_path}")
-            print(f"best_branch: {best_branch}")
+            print(f"branch: {plotted_branch}")
+            print(f"var: {args.var}")
             print(f"points: {point_count}")
             return 0
     return 0
@@ -573,70 +582,159 @@ def _linked_worktree_paths(repo: Repository, engine: MCTSEngine) -> list[Path]:
     return sorted(path for path in paths if path != repo.root.resolve())
 
 
-def _write_best_path_plot(repo: Repository, engine: MCTSEngine, raw_output_path: str | None) -> tuple[Path, str, int]:
-    best = engine.best()
-    if best is None or best.last_raw_score is None:
-        raise TreeGitError("no evaluated MCTS branches to plot")
-    nodes = {node.branch_name: node for node in engine.store.list_nodes()}
-    lineage = []
-    current = best
-    while current is not None:
-        if current.last_raw_score is not None:
-            lineage.append(current)
-        current = None if current.parent_branch_name is None else nodes.get(current.parent_branch_name)
-    lineage.reverse()
-    output_path = _resolve_plot_path(repo, raw_output_path)
+def _write_lineage_plot(
+    repo: Repository,
+    engine: MCTSEngine,
+    raw_output_path: str | None,
+    variable: str,
+    branch_name: str | None,
+) -> tuple[Path, str, int]:
+    plotted_branch = branch_name
+    if plotted_branch is None:
+        best = engine.best()
+        if best is None or best.last_raw_score is None:
+            raise TreeGitError("no evaluated MCTS branches to plot")
+        plotted_branch = best.branch_name
+    lineage = engine.store.lineage(plotted_branch)
+    points = []
+    missing = []
+    for node in lineage:
+        if node.last_eval_id is None:
+            continue
+        evaluation = engine.store.get_eval(node.last_eval_id)
+        if evaluation is None:
+            continue
+        value = _extract_plot_value(node, evaluation, variable)
+        if value is None:
+            missing.append(node.branch_name)
+            continue
+        points.append(
+            {
+                "branch_name": node.branch_name,
+                "depth": node.depth,
+                "value": value,
+                "created_at": evaluation.created_at,
+            }
+        )
+    if not points:
+        available = []
+        target_node = engine.store.get_node(plotted_branch)
+        target_eval = None if target_node is None or target_node.last_eval_id is None else engine.store.get_eval(target_node.last_eval_id)
+        if target_eval is not None:
+            available.extend(sorted(target_eval.result.metrics))
+            payload_inputs = target_eval.result.payload.get("inputs")
+            if isinstance(payload_inputs, dict):
+                available.extend(sorted(str(key) for key in payload_inputs))
+        available.extend(["score", "raw_score", "utility", "q_value"])
+        available = sorted(set(available))
+        raise TreeGitError(
+            f"no values found for variable {variable!r}; available examples: {', '.join(available[:12])}"
+        )
+    output_path = _resolve_plot_path(repo, raw_output_path, variable, plotted_branch, branch_name is None)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(_render_best_path_svg(lineage), encoding="utf-8")
-    return output_path, best.branch_name, len(lineage)
+    output_path.write_text(_render_lineage_svg(points, variable, plotted_branch, branch_name is None), encoding="utf-8")
+    return output_path, plotted_branch, len(points)
 
 
-def _resolve_plot_path(repo: Repository, raw_path: str | None) -> Path:
+def _resolve_plot_path(
+    repo: Repository,
+    raw_path: str | None,
+    variable: str,
+    branch_name: str,
+    is_best_default: bool,
+) -> Path:
     if raw_path is None:
-        return (repo.git_dir / "mcts-best-path.svg").resolve()
+        if is_best_default:
+            if variable in {"score", "raw_score"}:
+                filename = "mcts-best-path.svg"
+            else:
+                filename = f"mcts-best-path-{_sanitize_plot_var(variable)}.svg"
+        else:
+            branch_slug = _sanitize_plot_var(branch_name.replace("/", "-"))
+            if variable in {"score", "raw_score"}:
+                filename = f"mcts-lineage-{branch_slug}.svg"
+            else:
+                filename = f"mcts-lineage-{branch_slug}-{_sanitize_plot_var(variable)}.svg"
+        return (repo.git_dir / filename).resolve()
     path = Path(raw_path).expanduser()
     if not path.is_absolute():
         path = (repo.root / path).resolve()
     return path
 
 
-def _render_best_path_svg(lineage) -> str:
-    width = 960
-    height = 540
-    margin_left = 90
-    margin_right = 40
-    margin_top = 60
-    margin_bottom = 110
+def _sanitize_plot_var(value: str) -> str:
+    safe = "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in value)
+    return safe.strip("-_") or "value"
+
+
+def _extract_plot_value(node, evaluation, variable: str) -> float | None:
+    aliases = {
+        "score": node.last_raw_score,
+        "raw_score": node.last_raw_score,
+        "utility": node.last_utility,
+        "q_value": node.q_value,
+    }
+    if variable in aliases and aliases[variable] is not None:
+        return float(aliases[variable])
+
+    for source in (
+        evaluation.result.metrics,
+        evaluation.result.payload,
+        evaluation.result.payload.get("inputs") if isinstance(evaluation.result.payload, dict) else None,
+    ):
+        if not isinstance(source, dict):
+            continue
+        if variable not in source:
+            continue
+        value = source[variable]
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _render_lineage_svg(points, variable: str, branch_name: str, is_best_default: bool) -> str:
+    point_count = len(points)
+    width = min(1800, max(960, 220 + point_count * 22))
+    height = 620
+    margin_left = 110
+    margin_right = 36
+    margin_top = 78
+    margin_bottom = 100
     plot_width = width - margin_left - margin_right
     plot_height = height - margin_top - margin_bottom
 
-    scores = [float(node.last_raw_score) for node in lineage]
-    min_score = min(scores)
-    max_score = max(scores)
-    if min_score == max_score:
-        min_score -= 1.0
-        max_score += 1.0
-    score_span = max_score - min_score
-
-    if len(lineage) == 1:
+    values = [float(point["value"]) for point in points]
+    min_value = min(values)
+    max_value = max(values)
+    if min_value == max_value:
+        min_value -= 1.0
+        max_value += 1.0
+    value_span = max_value - min_value
+    if point_count == 1:
         x_positions = [margin_left + plot_width / 2.0]
     else:
-        x_step = plot_width / float(len(lineage) - 1)
-        x_positions = [margin_left + i * x_step for i in range(len(lineage))]
+        x_step = plot_width / float(point_count - 1)
+        x_positions = [margin_left + i * x_step for i in range(point_count)]
 
-    def y_for_score(score: float) -> float:
-        normalized = (score - min_score) / score_span
-        return margin_top + normalized * plot_height
+    def y_for_value(value: float) -> float:
+        normalized = (value - min_value) / value_span
+        return margin_top + (1.0 - normalized) * plot_height
 
-    points = [(x, y_for_score(float(node.last_raw_score))) for x, node in zip(x_positions, lineage)]
-    polyline_points = " ".join(f"{x:.2f},{y:.2f}" for x, y in points)
+    chart_points = [(x, y_for_value(float(point["value"]))) for x, point in zip(x_positions, points)]
+    polyline_points = " ".join(f"{x:.2f},{y:.2f}" for x, y in chart_points)
 
     grid_lines = []
     tick_labels = []
-    tick_count = 5
+    tick_count = 6
     for index in range(tick_count + 1):
         ratio = index / tick_count
-        score = min_score + ratio * score_span
+        value = max_value - ratio * value_span
         y = margin_top + ratio * plot_height
         grid_lines.append(
             f'<line x1="{margin_left}" y1="{y:.2f}" x2="{width - margin_right}" y2="{y:.2f}" '
@@ -645,47 +743,93 @@ def _render_best_path_svg(lineage) -> str:
         tick_labels.append(
             f'<text x="{margin_left - 12}" y="{y + 4:.2f}" text-anchor="end" '
             'font-family="monospace" font-size="12" fill="#374151">'
-            f"{escape(f'{score:.0f}')}"
+            f"{escape(_format_plot_value(value))}"
+            "</text>"
+        )
+
+    x_tick_labels = []
+    label_target = min(8, point_count)
+    label_step = max(1, (point_count - 1) // max(1, label_target - 1))
+    label_indices = sorted(set([0, point_count - 1, *range(0, point_count, label_step)]))
+    for index in label_indices:
+        x = x_positions[index]
+        x_tick_labels.append(
+            f'<line x1="{x:.2f}" y1="{height - margin_bottom}" x2="{x:.2f}" y2="{height - margin_bottom + 6}" '
+            'stroke="#6b7280" stroke-width="1" />'
+        )
+        x_tick_labels.append(
+            f'<text x="{x:.2f}" y="{height - margin_bottom + 22:.2f}" text-anchor="middle" '
+            'font-family="monospace" font-size="11" fill="#374151">'
+            f"{index + 1}"
             "</text>"
         )
 
     point_elements = []
-    for (x, y), node in zip(points, lineage):
-        score = float(node.last_raw_score)
-        label = node.branch_name
+    for index, ((x, y), point) in enumerate(zip(chart_points, points)):
+        value = float(point["value"])
+        radius = 6.0 if index in {0, point_count - 1} else 4.0
+        fill = "#0f766e" if index == point_count - 1 else "#2563eb"
         point_elements.append(
-            f'<circle cx="{x:.2f}" cy="{y:.2f}" r="4.5" fill="#2563eb" stroke="white" stroke-width="1.5" />'
-        )
-        point_elements.append(
-            f'<text x="{x:.2f}" y="{height - margin_bottom + 24:.2f}" text-anchor="middle" '
-            'font-family="monospace" font-size="11" fill="#111827">'
-            f"{escape(label)}"
-            "</text>"
-        )
-        point_elements.append(
-            f'<text x="{x:.2f}" y="{max(margin_top + 14.0, y - 10.0):.2f}" text-anchor="middle" '
-            'font-family="monospace" font-size="11" fill="#1f2937">'
-            f"{escape(f'{score:.0f}')}"
-            "</text>"
+            f'<circle cx="{x:.2f}" cy="{y:.2f}" r="{radius:.1f}" fill="{fill}" stroke="white" stroke-width="1.5">'
+            f"<title>{escape(point['branch_name'])} | {escape(variable)}={escape(_format_plot_value(value))}</title>"
+            "</circle>"
         )
 
-    title = "Best-Branch Lineage Score History"
-    subtitle = f"Lower is better. Branch count: {len(lineage)}"
+    start = float(points[0]["value"])
+    end = float(points[-1]["value"])
+    higher_is_better = variable in {"utility", "q_value"}
+    improvement = end - start if higher_is_better else start - end
+    direction_text = "Higher is better" if higher_is_better else "Lower is better"
+    title_prefix = "Best-Branch Lineage" if is_best_default else "Branch Lineage"
+    title = f"{title_prefix}: {branch_name} | {variable}"
+    subtitle = (
+        f"{direction_text}. Points: {point_count}. "
+        f"Start {_format_plot_value(start)} -> End {_format_plot_value(end)}. "
+        f"Improvement {_format_plot_value(improvement)}."
+    )
+    start_x, start_y = chart_points[0]
+    end_x, end_y = chart_points[-1]
+    annotations = [
+        f'<text x="{start_x:.2f}" y="{max(margin_top + 16.0, start_y - 14.0):.2f}" text-anchor="middle" '
+        'font-family="monospace" font-size="12" fill="#1f2937">'
+        f"{escape(points[0]['branch_name'])} {_format_plot_value(start)}"
+        "</text>",
+        f'<text x="{end_x:.2f}" y="{max(margin_top + 16.0, end_y - 14.0):.2f}" text-anchor="middle" '
+        'font-family="monospace" font-size="12" font-weight="700" fill="#0f766e">'
+        f"{escape(points[-1]['branch_name'])} {_format_plot_value(end)}"
+        "</text>",
+    ]
     return "\n".join(
         [
             f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
-            '<rect width="100%" height="100%" fill="white" />',
+            '<rect width="100%" height="100%" fill="#f8fafc" />',
+            f'<rect x="{margin_left}" y="{margin_top}" width="{plot_width}" height="{plot_height}" rx="10" fill="white" stroke="#d1d5db" stroke-width="1" />',
             f'<text x="{margin_left}" y="28" font-family="monospace" font-size="20" fill="#111827">{escape(title)}</text>',
             f'<text x="{margin_left}" y="48" font-family="monospace" font-size="12" fill="#4b5563">{escape(subtitle)}</text>',
             *grid_lines,
             f'<line x1="{margin_left}" y1="{margin_top}" x2="{margin_left}" y2="{height - margin_bottom}" stroke="#111827" stroke-width="1.5" />',
             f'<line x1="{margin_left}" y1="{height - margin_bottom}" x2="{width - margin_right}" y2="{height - margin_bottom}" stroke="#111827" stroke-width="1.5" />',
             *tick_labels,
+            *x_tick_labels,
             f'<polyline fill="none" stroke="#2563eb" stroke-width="2.5" points="{polyline_points}" />',
             *point_elements,
-            f'<text x="{margin_left}" y="{height - 18}" font-family="monospace" font-size="12" fill="#374151">Lineage order from root child to current best</text>',
-            f'<text transform="translate(18 {margin_top + plot_height / 2:.2f}) rotate(-90)" font-family="monospace" font-size="12" fill="#374151">score</text>',
+            *annotations,
+            f'<text x="{margin_left}" y="{height - 18}" font-family="monospace" font-size="12" fill="#374151">X-axis: lineage step from root to {escape(branch_name)}</text>',
+            f'<text transform="translate(22 {margin_top + plot_height / 2:.2f}) rotate(-90)" font-family="monospace" font-size="12" fill="#374151">{escape(variable)}</text>',
             "</svg>",
             "",
         ]
     )
+
+
+def _format_plot_value(value: float) -> str:
+    magnitude = abs(value)
+    if magnitude >= 1000:
+        return f"{value:,.0f}"
+    if magnitude >= 100:
+        return f"{value:,.1f}"
+    if magnitude >= 10:
+        return f"{value:,.2f}"
+    if magnitude >= 1:
+        return f"{value:,.4f}"
+    return f"{value:.6f}"
