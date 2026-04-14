@@ -96,6 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     mcts_plot_parser.add_argument("--output")
     mcts_plot_parser.add_argument("--var", default="score")
     mcts_plot_parser.add_argument("--branch")
+    mcts_plot_parser.add_argument("--view", choices=("lineage", "tree"), default="lineage")
 
     return parser
 
@@ -325,16 +326,18 @@ def run_command(args: argparse.Namespace) -> int:
                 print(f"artifact.{key}: {evaluation.result.artifacts[key]}")
             return 0
         if args.mcts_command == "plot":
-            output_path, plotted_branch, point_count = _write_lineage_plot(
+            output_path, plotted_branch, point_count = _write_mcts_plot(
                 primary_repo,
                 engine,
                 args.output,
                 args.var,
                 args.branch,
+                args.view,
             )
             print(f"output: {output_path}")
             print(f"branch: {plotted_branch}")
             print(f"var: {args.var}")
+            print(f"view: {args.view}")
             print(f"points: {point_count}")
             return 0
     return 0
@@ -582,6 +585,19 @@ def _linked_worktree_paths(repo: Repository, engine: MCTSEngine) -> list[Path]:
     return sorted(path for path in paths if path != repo.root.resolve())
 
 
+def _write_mcts_plot(
+    repo: Repository,
+    engine: MCTSEngine,
+    raw_output_path: str | None,
+    variable: str,
+    branch_name: str | None,
+    view: str,
+) -> tuple[Path, str, int]:
+    if view == "tree":
+        return _write_tree_plot(repo, engine, raw_output_path, variable, branch_name)
+    return _write_lineage_plot(repo, engine, raw_output_path, variable, branch_name)
+
+
 def _write_lineage_plot(
     repo: Repository,
     engine: MCTSEngine,
@@ -630,10 +646,70 @@ def _write_lineage_plot(
         raise TreeGitError(
             f"no values found for variable {variable!r}; available examples: {', '.join(available[:12])}"
         )
-    output_path = _resolve_plot_path(repo, raw_output_path, variable, plotted_branch, branch_name is None)
+    output_path = _resolve_plot_path(
+        repo,
+        raw_output_path,
+        variable,
+        plotted_branch,
+        branch_name is None,
+        view="lineage",
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(_render_lineage_svg(points, variable, plotted_branch, branch_name is None), encoding="utf-8")
     return output_path, plotted_branch, len(points)
+
+
+def _write_tree_plot(
+    repo: Repository,
+    engine: MCTSEngine,
+    raw_output_path: str | None,
+    variable: str,
+    branch_name: str | None,
+) -> tuple[Path, str, int]:
+    nodes = engine.store.list_nodes()
+    if not nodes:
+        raise TreeGitError("no MCTS nodes to plot")
+    nodes_by_branch = {node.branch_name: node for node in nodes}
+    focus_branch = branch_name
+    if focus_branch is None:
+        best = engine.best()
+        focus_branch = best.branch_name if best is not None else nodes[0].branch_name
+    if focus_branch not in nodes_by_branch:
+        raise TreeGitError(f"unknown MCTS node {focus_branch!r}")
+
+    points = []
+    has_values = False
+    for node in nodes:
+        evaluation = None if node.last_eval_id is None else engine.store.get_eval(node.last_eval_id)
+        value = None if evaluation is None else _extract_plot_value(node, evaluation, variable)
+        if value is not None:
+            has_values = True
+        points.append(
+            {
+                "branch_name": node.branch_name,
+                "parent_branch_name": node.parent_branch_name,
+                "depth": node.depth,
+                "status": node.status,
+                "child_count": node.child_count,
+                "visit_count": node.visit_count,
+                "value": value,
+            }
+        )
+    if not has_values:
+        raise TreeGitError(
+            f"no values found for variable {variable!r}; available examples: {', '.join(_available_plot_variables(engine, focus_branch)[:12])}"
+        )
+    output_path = _resolve_plot_path(
+        repo,
+        raw_output_path,
+        variable,
+        focus_branch,
+        branch_name is None,
+        view="tree",
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(_render_tree_svg(points, variable, focus_branch, branch_name is None), encoding="utf-8")
+    return output_path, focus_branch, len(points)
 
 
 def _resolve_plot_path(
@@ -642,19 +718,33 @@ def _resolve_plot_path(
     variable: str,
     branch_name: str,
     is_best_default: bool,
+    view: str,
 ) -> Path:
     if raw_path is None:
-        if is_best_default:
-            if variable in {"score", "raw_score"}:
-                filename = "mcts-best-path.svg"
+        if view == "tree":
+            if is_best_default:
+                if variable in {"score", "raw_score"}:
+                    filename = "mcts-tree.svg"
+                else:
+                    filename = f"mcts-tree-{_sanitize_plot_var(variable)}.svg"
             else:
-                filename = f"mcts-best-path-{_sanitize_plot_var(variable)}.svg"
+                branch_slug = _sanitize_plot_var(branch_name.replace("/", "-"))
+                if variable in {"score", "raw_score"}:
+                    filename = f"mcts-tree-{branch_slug}.svg"
+                else:
+                    filename = f"mcts-tree-{branch_slug}-{_sanitize_plot_var(variable)}.svg"
         else:
-            branch_slug = _sanitize_plot_var(branch_name.replace("/", "-"))
-            if variable in {"score", "raw_score"}:
-                filename = f"mcts-lineage-{branch_slug}.svg"
+            if is_best_default:
+                if variable in {"score", "raw_score"}:
+                    filename = "mcts-best-path.svg"
+                else:
+                    filename = f"mcts-best-path-{_sanitize_plot_var(variable)}.svg"
             else:
-                filename = f"mcts-lineage-{branch_slug}-{_sanitize_plot_var(variable)}.svg"
+                branch_slug = _sanitize_plot_var(branch_name.replace("/", "-"))
+                if variable in {"score", "raw_score"}:
+                    filename = f"mcts-lineage-{branch_slug}.svg"
+                else:
+                    filename = f"mcts-lineage-{branch_slug}-{_sanitize_plot_var(variable)}.svg"
         return (repo.git_dir / filename).resolve()
     path = Path(raw_path).expanduser()
     if not path.is_absolute():
@@ -696,6 +786,19 @@ def _extract_plot_value(node, evaluation, variable: str) -> float | None:
         except (TypeError, ValueError):
             return None
     return None
+
+
+def _available_plot_variables(engine: MCTSEngine, branch_name: str) -> list[str]:
+    available = []
+    target_node = engine.store.get_node(branch_name)
+    target_eval = None if target_node is None or target_node.last_eval_id is None else engine.store.get_eval(target_node.last_eval_id)
+    if target_eval is not None:
+        available.extend(sorted(target_eval.result.metrics))
+        payload_inputs = target_eval.result.payload.get("inputs")
+        if isinstance(payload_inputs, dict):
+            available.extend(sorted(str(key) for key in payload_inputs))
+    available.extend(["score", "raw_score", "utility", "q_value"])
+    return sorted(set(available))
 
 
 def _render_lineage_svg(points, variable: str, branch_name: str, is_best_default: bool) -> str:
@@ -816,6 +919,176 @@ def _render_lineage_svg(points, variable: str, branch_name: str, is_best_default
             *annotations,
             f'<text x="{margin_left}" y="{height - 18}" font-family="monospace" font-size="12" fill="#374151">X-axis: lineage step from root to {escape(branch_name)}</text>',
             f'<text transform="translate(22 {margin_top + plot_height / 2:.2f}) rotate(-90)" font-family="monospace" font-size="12" fill="#374151">{escape(variable)}</text>',
+            "</svg>",
+            "",
+        ]
+    )
+
+
+def _render_tree_svg(points, variable: str, focus_branch: str, is_best_default: bool) -> str:
+    points_by_branch = {point["branch_name"]: point for point in points}
+    children_by_parent = defaultdict(list)
+    for point in points:
+        children_by_parent[point["parent_branch_name"]].append(point["branch_name"])
+    for child_names in children_by_parent.values():
+        child_names.sort()
+
+    leaf_count = 0
+    y_positions: dict[str, float] = {}
+
+    def assign_y(branch_name: str) -> float:
+        nonlocal leaf_count
+        child_names = children_by_parent.get(branch_name, [])
+        if not child_names:
+            y = float(leaf_count)
+            leaf_count += 1
+            y_positions[branch_name] = y
+            return y
+        child_ys = [assign_y(child_name) for child_name in child_names]
+        y = sum(child_ys) / float(len(child_ys))
+        y_positions[branch_name] = y
+        return y
+
+    root_names = children_by_parent.get(None, [])
+    for root_name in root_names:
+        assign_y(root_name)
+
+    branch_order = sorted(points_by_branch, key=lambda name: (points_by_branch[name]["depth"], y_positions.get(name, 0.0), name))
+    max_depth = max(int(point["depth"]) for point in points)
+    leaf_slots = max(1, leaf_count)
+    width = min(2400, max(1120, 380 + max_depth * 260))
+    height = min(2800, max(680, 220 + leaf_slots * 82))
+    margin_left = 110
+    margin_right = 280
+    margin_top = 84
+    margin_bottom = 56
+    plot_width = width - margin_left - margin_right
+    plot_height = height - margin_top - margin_bottom
+    x_step = 0.0 if max_depth == 0 else plot_width / float(max_depth)
+    y_step = 0.0 if leaf_slots <= 1 else plot_height / float(leaf_slots - 1)
+
+    x_positions = {
+        branch_name: margin_left + float(points_by_branch[branch_name]["depth"]) * x_step
+        for branch_name in points_by_branch
+    }
+    if leaf_slots <= 1:
+        base_y = margin_top + plot_height / 2.0
+        absolute_y_positions = {branch_name: base_y for branch_name in points_by_branch}
+    else:
+        absolute_y_positions = {
+            branch_name: margin_top + y_positions.get(branch_name, 0.0) * y_step
+            for branch_name in points_by_branch
+        }
+
+    available_values = [float(point["value"]) for point in points if point["value"] is not None]
+    min_value = min(available_values)
+    max_value = max(available_values)
+    value_span = max_value - min_value
+
+    def node_fill(value: float | None) -> str:
+        if value is None:
+            return "#cbd5e1"
+        if value_span == 0:
+            ratio = 0.5
+        else:
+            ratio = (float(value) - min_value) / value_span
+        red = int(234 + (15 - 234) * ratio)
+        green = int(179 + (118 - 179) * ratio)
+        blue = int(8 + (110 - 8) * ratio)
+        return f"#{red:02x}{green:02x}{blue:02x}"
+
+    highlight_branches = set()
+    current_branch = focus_branch
+    while current_branch is not None and current_branch in points_by_branch:
+        highlight_branches.add(current_branch)
+        current_branch = points_by_branch[current_branch]["parent_branch_name"]
+
+    depth_guides = []
+    for depth in range(max_depth + 1):
+        x = margin_left + depth * x_step
+        depth_guides.append(
+            f'<line x1="{x:.2f}" y1="{margin_top}" x2="{x:.2f}" y2="{height - margin_bottom}" stroke="#e5e7eb" stroke-width="1" />'
+        )
+
+    edge_elements = []
+    for branch_name in branch_order:
+        point = points_by_branch[branch_name]
+        parent_name = point["parent_branch_name"]
+        if parent_name is None or parent_name not in points_by_branch:
+            continue
+        is_highlight = branch_name in highlight_branches and parent_name in highlight_branches
+        edge_elements.append(
+            f'<line x1="{x_positions[parent_name]:.2f}" y1="{absolute_y_positions[parent_name]:.2f}" '
+            f'x2="{x_positions[branch_name]:.2f}" y2="{absolute_y_positions[branch_name]:.2f}" '
+            f'stroke="{"#0f766e" if is_highlight else "#94a3b8"}" '
+            f'stroke-width="{"3" if is_highlight else "1.5"}" '
+            f'stroke-opacity="{"0.95" if is_highlight else "0.7"}" />'
+        )
+
+    node_elements = []
+    label_elements = []
+    for branch_name in branch_order:
+        point = points_by_branch[branch_name]
+        value = point["value"]
+        is_focus = branch_name == focus_branch
+        is_highlight = branch_name in highlight_branches
+        radius = 10.0 if is_focus else 7.0 if is_highlight else 6.0
+        stroke = "#0f172a" if is_focus else "#0f766e" if is_highlight else "#334155"
+        stroke_width = 2.5 if is_focus else 2.0 if is_highlight else 1.25
+        node_elements.append(
+            f'<circle cx="{x_positions[branch_name]:.2f}" cy="{absolute_y_positions[branch_name]:.2f}" '
+            f'r="{radius:.1f}" fill="{node_fill(value)}" stroke="{stroke}" stroke-width="{stroke_width:.2f}">'
+            f"<title>{escape(branch_name)} | status={escape(str(point['status']))} | {escape(variable)}={escape('n/a' if value is None else _format_plot_value(float(value)))}</title>"
+            "</circle>"
+        )
+        value_label = "n/a" if value is None else _format_plot_value(float(value))
+        label_font_weight = "700" if is_focus else "600" if is_highlight else "400"
+        label_elements.append(
+            f'<text x="{x_positions[branch_name] + 12:.2f}" y="{absolute_y_positions[branch_name] - 2:.2f}" '
+            f'font-family="monospace" font-size="12" font-weight="{label_font_weight}" fill="#0f172a">'
+            f"{escape(branch_name)}"
+            "</text>"
+        )
+        label_elements.append(
+            f'<text x="{x_positions[branch_name] + 12:.2f}" y="{absolute_y_positions[branch_name] + 14:.2f}" '
+            'font-family="monospace" font-size="11" fill="#475569">'
+            f"{escape(variable)}={escape(value_label)}"
+            "</text>"
+        )
+
+    title = f"Search Tree: {variable}"
+    subtitle = (
+        f"Entire MCTS tree with {len(points)} nodes. "
+        f"Highlight: {focus_branch}. "
+        f"Color scale maps low to high {variable}; gray means unavailable."
+    )
+    caption = "default focus = current best branch" if is_best_default else "focus branch selected with --branch"
+    legend_x = width - margin_right + 32
+    legend_y = margin_top + 24
+    legend_blocks = [
+        f'<rect x="{legend_x}" y="{legend_y}" width="22" height="12" fill="{node_fill(min_value)}" stroke="#334155" stroke-width="0.8" />',
+        f'<rect x="{legend_x}" y="{legend_y + 18}" width="22" height="12" fill="{node_fill((min_value + max_value) / 2.0)}" stroke="#334155" stroke-width="0.8" />',
+        f'<rect x="{legend_x}" y="{legend_y + 36}" width="22" height="12" fill="{node_fill(max_value)}" stroke="#334155" stroke-width="0.8" />',
+        f'<rect x="{legend_x}" y="{legend_y + 54}" width="22" height="12" fill="#cbd5e1" stroke="#334155" stroke-width="0.8" />',
+        f'<text x="{legend_x + 30}" y="{legend_y + 10}" font-family="monospace" font-size="11" fill="#334155">low {_format_plot_value(min_value)}</text>',
+        f'<text x="{legend_x + 30}" y="{legend_y + 28}" font-family="monospace" font-size="11" fill="#334155">mid {_format_plot_value((min_value + max_value) / 2.0)}</text>',
+        f'<text x="{legend_x + 30}" y="{legend_y + 46}" font-family="monospace" font-size="11" fill="#334155">high {_format_plot_value(max_value)}</text>',
+        f'<text x="{legend_x + 30}" y="{legend_y + 64}" font-family="monospace" font-size="11" fill="#334155">missing value</text>',
+    ]
+
+    return "\n".join(
+        [
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+            '<rect width="100%" height="100%" fill="#f8fafc" />',
+            f'<rect x="{margin_left - 22}" y="{margin_top - 22}" width="{plot_width + 44}" height="{plot_height + 44}" rx="18" fill="white" stroke="#d1d5db" stroke-width="1" />',
+            f'<text x="{margin_left}" y="30" font-family="monospace" font-size="22" fill="#111827">{escape(title)}</text>',
+            f'<text x="{margin_left}" y="52" font-family="monospace" font-size="12" fill="#475569">{escape(subtitle)}</text>',
+            f'<text x="{margin_left}" y="{height - 18}" font-family="monospace" font-size="11" fill="#475569">X-axis: branch depth from root. {escape(caption)}.</text>',
+            *depth_guides,
+            *edge_elements,
+            *node_elements,
+            *label_elements,
+            *legend_blocks,
             "</svg>",
             "",
         ]

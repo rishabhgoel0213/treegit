@@ -125,6 +125,7 @@ treegit mcts step <run_id>
 treegit mcts run <run_id> [--steps N]
 treegit mcts status <run_id>
 treegit mcts best <run_id>
+treegit mcts plot [--view lineage|tree] [--var name] [--branch name] [--output path]
 ```
 
 ## MCTS Config

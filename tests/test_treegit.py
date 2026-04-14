@@ -853,6 +853,7 @@ print(json.dumps({
         self.assertEqual(plot.returncode, 0, plot.stderr)
         self.assertIn(f"output: {plot_path.resolve()}", plot.stdout)
         self.assertIn("branch: mcts/000002", plot.stdout)
+        self.assertIn("view: lineage", plot.stdout)
         self.assertTrue(plot_path.exists())
         svg = plot_path.read_text(encoding="utf-8")
         self.assertIn("<svg", svg)
@@ -871,6 +872,7 @@ print(json.dumps({
         self.assertEqual(utility_plot.returncode, 0, utility_plot.stderr)
         self.assertIn(f"output: {utility_plot_path.resolve()}", utility_plot.stdout)
         self.assertIn("var: utility", utility_plot.stdout)
+        self.assertIn("view: lineage", utility_plot.stdout)
         utility_svg = utility_plot_path.read_text(encoding="utf-8")
         self.assertIn("Best-Branch Lineage: mcts/000002 | utility", utility_svg)
 
@@ -887,9 +889,30 @@ print(json.dumps({
         self.assertEqual(branch_plot.returncode, 0, branch_plot.stderr)
         self.assertIn(f"output: {branch_plot_path.resolve()}", branch_plot.stdout)
         self.assertIn("branch: mcts/000001", branch_plot.stdout)
+        self.assertIn("view: lineage", branch_plot.stdout)
         branch_svg = branch_plot_path.read_text(encoding="utf-8")
         self.assertIn("Branch Lineage: mcts/000001 | score", branch_svg)
         self.assertIn("mcts/000001", branch_svg)
+
+        tree_plot_path = self.workspace / "search-tree.svg"
+        tree_plot = self.run_cli(
+            "mcts",
+            "plot",
+            "--view",
+            "tree",
+            "--output",
+            str(tree_plot_path),
+            cwd=main_dir,
+        )
+        self.assertEqual(tree_plot.returncode, 0, tree_plot.stderr)
+        self.assertIn(f"output: {tree_plot_path.resolve()}", tree_plot.stdout)
+        self.assertIn("branch: mcts/000002", tree_plot.stdout)
+        self.assertIn("view: tree", tree_plot.stdout)
+        tree_svg = tree_plot_path.read_text(encoding="utf-8")
+        self.assertIn("Search Tree: score", tree_svg)
+        self.assertIn("root", tree_svg)
+        self.assertIn("mcts/000001", tree_svg)
+        self.assertIn("mcts/000002", tree_svg)
 
     def test_cli_mcts_run_background_detaches_and_logs(self) -> None:
         main_dir = self.workspace / "main"
