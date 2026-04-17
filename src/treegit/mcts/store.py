@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS mcts_nodes (
     child_count INTEGER NOT NULL,
     visit_count INTEGER NOT NULL,
     value_sum REAL NOT NULL,
+    normalized_value_sum REAL NOT NULL DEFAULT 0.0,
     last_utility REAL,
     last_raw_score REAL,
     last_eval_id TEXT,
@@ -107,6 +108,7 @@ class MCTSStore:
         conn = self.index.connect()
         try:
             conn.executescript(SCHEMA)
+            _ensure_column(conn, "mcts_nodes", "normalized_value_sum", "REAL NOT NULL DEFAULT 0.0")
             conn.commit()
         finally:
             conn.close()
@@ -156,10 +158,10 @@ class MCTSStore:
                 """
                 INSERT INTO mcts_nodes(
                     run_id, branch_name, parent_branch_name, commit_id, depth, child_count,
-                    visit_count, value_sum, last_utility, last_raw_score, last_eval_id,
+                    visit_count, value_sum, normalized_value_sum, last_utility, last_raw_score, last_eval_id,
                     status, terminal_reason, worktree_path, created_at, updated_at
                 )
-                VALUES (?, ?, NULL, ?, 0, 0, 0, 0.0, NULL, NULL, NULL, 'ready', NULL, NULL, ?, ?)
+                VALUES (?, ?, NULL, ?, 0, 0, 0, 0.0, 0.0, NULL, NULL, NULL, 'ready', NULL, NULL, ?, ?)
                 """,
                 (ACTIVE_SEARCH_ID, root_branch, root_commit_id, now, now),
             )
@@ -228,7 +230,7 @@ class MCTSStore:
             conn.close()
         return list(range(start, start + count))
 
-    def list_frontier_nodes(self) -> list[SearchNodeRecord]:
+    def list_expandable_nodes(self) -> list[SearchNodeRecord]:
         conn = self.index.connect()
         try:
             rows = conn.execute(
@@ -239,7 +241,6 @@ class MCTSStore:
                   ON p.run_id = n.run_id
                  AND p.branch_name = n.parent_branch_name
                 WHERE n.run_id = ?
-                  AND n.child_count = 0
                   AND n.status = 'ready'
                 ORDER BY n.depth ASC, n.branch_name ASC
                 """,
@@ -248,6 +249,9 @@ class MCTSStore:
         finally:
             conn.close()
         return [_row_to_node(row) for row in rows]
+
+    def list_frontier_nodes(self) -> list[SearchNodeRecord]:
+        return self.list_expandable_nodes()
 
     def get_node(self, branch_name: str) -> SearchNodeRecord | None:
         conn = self.index.connect()
@@ -379,10 +383,10 @@ class MCTSStore:
                 """
                 INSERT INTO mcts_nodes(
                     run_id, branch_name, parent_branch_name, commit_id, depth, child_count,
-                    visit_count, value_sum, last_utility, last_raw_score, last_eval_id,
+                    visit_count, value_sum, normalized_value_sum, last_utility, last_raw_score, last_eval_id,
                     status, terminal_reason, worktree_path, created_at, updated_at
                 )
-                VALUES (?, ?, ?, NULL, ?, 0, 0, 0.0, NULL, NULL, NULL, 'expanding', NULL, ?, ?, ?)
+                VALUES (?, ?, ?, NULL, ?, 0, 0, 0.0, 0.0, NULL, NULL, NULL, 'expanding', NULL, ?, ?, ?)
                 """,
                 (ACTIVE_SEARCH_ID, branch_name, parent_branch_name, depth, worktree_path, now, now),
             )
@@ -556,7 +560,24 @@ class MCTSStore:
             artifacts=json.loads(row["artifacts_json"]),
         )
 
-    def backprop(self, branch_name: str, utility: float) -> None:
+    def list_backprop_utilities(self) -> list[float]:
+        conn = self.index.connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT utility
+                FROM mcts_evals
+                WHERE run_id = ?
+                  AND utility IS NOT NULL
+                ORDER BY created_at ASC, eval_id ASC
+                """,
+                (ACTIVE_SEARCH_ID,),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [float(row["utility"]) for row in rows]
+
+    def backprop(self, branch_name: str, utility: float, normalized_utility: float) -> None:
         conn = self.index.connect()
         try:
             conn.execute("BEGIN")
@@ -568,10 +589,11 @@ class MCTSStore:
                     UPDATE mcts_nodes
                     SET visit_count = visit_count + 1,
                         value_sum = value_sum + ?,
+                        normalized_value_sum = normalized_value_sum + ?,
                         updated_at = ?
                     WHERE run_id = ? AND branch_name = ?
                     """,
-                    (utility, now, ACTIVE_SEARCH_ID, current_branch),
+                    (utility, normalized_utility, now, ACTIVE_SEARCH_ID, current_branch),
                 )
                 row = conn.execute(
                     """
@@ -639,7 +661,7 @@ class MCTSStore:
                 """
                 SELECT COUNT(*) AS count
                 FROM mcts_nodes
-                WHERE run_id = ? AND child_count = 0 AND status = 'ready'
+                WHERE run_id = ? AND status = 'ready'
                 """,
                 (ACTIVE_SEARCH_ID,),
             ).fetchone()
@@ -715,6 +737,7 @@ def _row_to_node(row) -> SearchNodeRecord:
         child_count=int(row["child_count"]),
         visit_count=int(row["visit_count"]),
         value_sum=float(row["value_sum"]),
+        normalized_value_sum=float(row["normalized_value_sum"]),
         last_utility=None if row["last_utility"] is None else float(row["last_utility"]),
         last_raw_score=None if row["last_raw_score"] is None else float(row["last_raw_score"]),
         last_eval_id=row["last_eval_id"],
@@ -758,6 +781,16 @@ def _row_to_note(row) -> SearchNoteRecord:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
+
+
+def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, column_sql: str) -> None:
+    columns = {
+        row["name"]
+        for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    if column_name in columns:
+        return
+    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
 
 
 def _utcnow() -> str:

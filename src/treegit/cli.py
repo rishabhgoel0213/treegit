@@ -237,11 +237,11 @@ def run_command(args: argparse.Namespace) -> int:
             return 0
         if args.mcts_command == "step":
             result = engine.step()
-            print(f"selected: {result.selected_branch}")
+            print(f"selected: {_format_selected_parents(result.selected_parents)}")
             for child in result.children:
                 utility = "None" if child.utility is None else f"{child.utility:.6f}"
                 print(
-                    f"{child.branch_name} status={child.status} commit={child.commit_id or ''} "
+                    f"{child.branch_name} parent={child.parent_branch_name} status={child.status} commit={child.commit_id or ''} "
                     f"utility={utility} reason={child.reason or ''}".rstrip()
                 )
             print(f"frontier_count: {result.frontier_count}")
@@ -268,7 +268,7 @@ def run_command(args: argparse.Namespace) -> int:
                     _clear_background_state(primary_repo, expected_pid=os.getpid())
             print(f"steps_executed: {len(results)}", flush=True)
             if results:
-                print(f"last_selected: {results[-1].selected_branch}", flush=True)
+                print(f"last_selected: {_format_selected_parents(results[-1].selected_parents)}", flush=True)
                 if results[-1].best_branch is not None:
                     print(f"best_branch: {results[-1].best_branch}", flush=True)
             return 0
@@ -297,6 +297,7 @@ def run_command(args: argparse.Namespace) -> int:
                 print(f"raw_score: {best.last_raw_score}")
                 print(f"visits: {best.visit_count}")
                 print(f"value_sum: {best.value_sum}")
+                print(f"normalized_value_sum: {best.normalized_value_sum}")
             return 0
         if args.mcts_command == "inspect":
             node, evaluation = engine.inspect(args.branch)
@@ -308,6 +309,7 @@ def run_command(args: argparse.Namespace) -> int:
             print(f"child_count: {node.child_count}")
             print(f"visits: {node.visit_count}")
             print(f"value_sum: {node.value_sum}")
+            print(f"normalized_value_sum: {node.normalized_value_sum}")
             print(f"q_value: {node.q_value}")
             print(f"last_utility: {node.last_utility}")
             print(f"last_raw_score: {node.last_raw_score}")
@@ -352,11 +354,11 @@ def _run_mcts_steps(engine: MCTSEngine, steps: int) -> list:
         result = engine.step()
         results.append(result)
         print(f"step: {index + 1}", flush=True)
-        print(f"selected: {result.selected_branch}", flush=True)
+        print(f"selected: {_format_selected_parents(result.selected_parents)}", flush=True)
         for child in result.children:
             utility = "None" if child.utility is None else f"{child.utility:.6f}"
             print(
-                f"{child.branch_name} status={child.status} commit={child.commit_id or ''} "
+                f"{child.branch_name} parent={child.parent_branch_name} status={child.status} commit={child.commit_id or ''} "
                 f"utility={utility} reason={child.reason or ''}".rstrip(),
                 flush=True,
             )
@@ -364,6 +366,18 @@ def _run_mcts_steps(engine: MCTSEngine, steps: int) -> list:
         if result.best_branch is not None:
             print(f"best_branch: {result.best_branch}", flush=True)
     return results
+
+
+def _format_selected_parents(selected_parents: list[str]) -> str:
+    if not selected_parents:
+        return "none"
+    counts: dict[str, int] = {}
+    for branch_name in selected_parents:
+        counts[branch_name] = counts.get(branch_name, 0) + 1
+    parts = []
+    for branch_name, count in counts.items():
+        parts.append(branch_name if count == 1 else f"{branch_name} x{count}")
+    return ", ".join(parts)
 
 
 def _spawn_background_mcts_run(repo: Repository, *, steps: int, log_file: str | None) -> tuple[Path, int]:

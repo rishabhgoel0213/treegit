@@ -135,12 +135,12 @@ The MCTS entrypoint is command-based and objective-agnostic. The config file is 
 - `root_branch`
 - `worktree_root`
 - `branch_prefix`
-- `expansion_width`
-- `selection.policy` and `selection.exploration_constant`
+- `iteration_budget` (`expansion_width` is accepted as a legacy alias)
+- `selection.policy`, `selection.exploration_constant`, `selection.widening_coefficient`, `selection.widening_exponent`, and `selection.virtual_loss`
 - `expander.command`
 - `objective.id`, `objective.version`, and `objective.command`
 
-The expander command runs in a fresh worktree for each child branch. It is expected to edit files and exit; TreeGit commits the resulting change. The objective command then runs in that worktree and must print a JSON object containing a scalar `utility` or a `raw_score` plus `direction`.
+The expander command runs in a fresh worktree for each allocated budget slot. TreeGit uses a budgeted UCB selector with progressive widening, so one iteration can split work across multiple parent branches or spend multiple slots on the same parent when that still scores best. Objective commands still report raw `utility`, but TreeGit now backpropagates a clipped robust z-score normalization of observed utilities so exploration constants and virtual loss stay meaningful across objectives with very different score scales.
 
 ## Notes
 

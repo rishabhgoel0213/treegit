@@ -5,11 +5,13 @@ import json
 import math
 import re
 import uuid
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from statistics import median
 
 from treegit.errors import MCTSExecutionError, MCTSSelectionError, ReferenceResolutionError
-from treegit.mcts.models import EvalResult, SearchEvalRecord, SearchNodeRecord, StepChildResult, StepResult
+from treegit.mcts.models import EvalResult, SearchEvalRecord, SearchNodeRecord, SelectionSpec, StepChildResult, StepResult
 from treegit.mcts.runner import run_command
 from treegit.mcts.spec import load_search_spec
 from treegit.mcts.store import MCTSStore
@@ -20,10 +22,13 @@ MCTS_CONTEXT_DIR = ".treegit/mcts"
 CHANGE_HISTORY_NAME = "change_history.md"
 SCORE_HISTORY_NAME = "score_history.md"
 CURRENT_CHANGE_NAME = "current_change.md"
+NORMALIZED_UTILITY_CLIP = 3.0
+NORMALIZED_UTILITY_EPS = 1e-6
 
 
 @dataclass(frozen=True)
 class _PreparedChild:
+    parent_branch_name: str
     branch_name: str
     child_repo: Repository
     worktree_path: Path
@@ -46,11 +51,10 @@ class MCTSEngine:
 
     def step(self) -> StepResult:
         search = self.store.get_search()
-        selected = self._select_node(search.spec.selection.exploration_constant)
-        self.store.mark_node_status(selected.branch_name, "expanding")
-        child_indices = self.store.reserve_child_indices(search.spec.expansion_width)
+        selected_parents = self._select_nodes_for_budget(search)
+        child_indices = self.store.reserve_child_indices(len(selected_parents))
         prepared_children: list[_PreparedChild] = []
-        for agent_slot, child_index in enumerate(child_indices, start=1):
+        for agent_slot, (selected, child_index) in enumerate(zip(selected_parents, child_indices), start=1):
             child_branch = _branch_name(search.spec.branch_prefix, child_index)
             worktree_path = (search.spec.worktree_root / f"agent{agent_slot}").resolve()
             artifact_root = (search.spec.artifact_root / f"agent{agent_slot}" / child_branch.replace("/", "_")).resolve()
@@ -82,6 +86,7 @@ class MCTSEngine:
             self._prepare_agent_context(selected, child_branch, worktree_path, context)
             prepared_children.append(
                 _PreparedChild(
+                    parent_branch_name=selected.branch_name,
                     branch_name=child_branch,
                     child_repo=child_repo,
                     worktree_path=worktree_path,
@@ -91,17 +96,16 @@ class MCTSEngine:
         expander_results = self._run_expanders_parallel(search.spec, prepared_children)
         children = [
             self._finalize_child(search, selected, prepared_child, expander_results[prepared_child.branch_name])
-            for prepared_child in prepared_children
+            for selected, prepared_child in zip(selected_parents, prepared_children)
         ]
 
-        self.store.mark_node_status(selected.branch_name, "expanded")
         frontier_count = self.store.frontier_count()
         best = self.store.best_node()
         next_status = "completed" if frontier_count == 0 else "running"
         self.store.increment_steps(status=next_status)
         search_after = self.store.get_search()
         return StepResult(
-            selected_branch=selected.branch_name,
+            selected_parents=[selected.branch_name for selected in selected_parents],
             children=children,
             frontier_count=frontier_count,
             best_branch=None if best is None else best.branch_name,
@@ -141,28 +145,71 @@ class MCTSEngine:
             return node, None
         return node, self.store.get_eval(node.last_eval_id)
 
-    def _select_node(self, exploration_constant: float) -> SearchNodeRecord:
-        frontier = self.store.list_frontier_nodes()
-        if not frontier:
-            raise MCTSSelectionError("no expandable frontier nodes remain")
-        scored: list[tuple[float, SearchNodeRecord]] = []
-        for node in frontier:
-            if node.visit_count <= 0:
-                score = float("inf")
-            else:
-                parent_visits = 1 if node.parent_visit_count is None else max(1, node.parent_visit_count)
-                score = node.q_value + exploration_constant * math.sqrt(math.log(parent_visits + 1.0) / node.visit_count)
-            scored.append((score, node))
-        scored.sort(
-            key=lambda item: (
-                item[0],
-                float("-inf") if item[1].last_utility is None else item[1].last_utility,
-                -item[1].depth,
-                item[1].branch_name,
-            ),
-            reverse=True,
+    def _select_nodes_for_budget(self, search) -> list[SearchNodeRecord]:
+        expandable = self.store.list_expandable_nodes()
+        if not expandable:
+            raise MCTSSelectionError("no expandable nodes remain")
+        root = self.store.get_node(search.root_branch)
+        root_visits = 0 if root is None else root.visit_count
+        pending_by_branch: dict[str, int] = defaultdict(int)
+        selected: list[SearchNodeRecord] = []
+        for _ in range(search.spec.iteration_budget):
+            total_visits = root_visits + len(selected)
+            candidates: list[tuple[float, SearchNodeRecord, int]] = []
+            for node in expandable:
+                pending_expansions = pending_by_branch[node.branch_name]
+                if not self._can_expand_node(node, pending_expansions, search.spec.selection):
+                    continue
+                score = self._score_expandable_node(
+                    node,
+                    pending_expansions=pending_expansions,
+                    total_visits=total_visits,
+                    selection=search.spec.selection,
+                )
+                candidates.append((score, node, pending_expansions))
+            if not candidates:
+                break
+            candidates.sort(
+                key=lambda item: (
+                    -item[0],
+                    float("inf") if item[1].last_utility is None else -item[1].last_utility,
+                    item[1].child_count + item[2],
+                    -item[1].depth,
+                    item[1].branch_name,
+                )
+            )
+            chosen = candidates[0][1]
+            pending_by_branch[chosen.branch_name] += 1
+            selected.append(chosen)
+        if not selected:
+            raise MCTSSelectionError("no nodes were eligible for expansion under the configured widening rule")
+        return selected
+
+    def _can_expand_node(self, node: SearchNodeRecord, pending_expansions: int, selection: SelectionSpec) -> bool:
+        if node.status != "ready":
+            return False
+        projected_children = node.child_count + pending_expansions
+        widening_trials = max(1, node.visit_count + projected_children + 1)
+        max_children = max(
+            1,
+            math.ceil(selection.widening_coefficient * (widening_trials ** selection.widening_exponent)),
         )
-        return scored[0][1]
+        return projected_children < max_children
+
+    def _score_expandable_node(
+        self,
+        node: SearchNodeRecord,
+        *,
+        pending_expansions: int,
+        total_visits: int,
+        selection: SelectionSpec,
+    ) -> float:
+        effective_visits = max(1, node.visit_count + pending_expansions)
+        exploration = selection.exploration_constant * math.sqrt(math.log(total_visits + 1.0) / effective_visits)
+        score = node.q_value + exploration
+        if pending_expansions:
+            score -= pending_expansions * selection.virtual_loss
+        return score
 
     def _finalize_child(
         self,
@@ -178,6 +225,7 @@ class MCTSEngine:
         if expander_reason is not None:
             self.store.mark_node_status(child_branch, "failed", terminal_reason=expander_reason)
             return StepChildResult(
+                parent_branch_name=prepared_child.parent_branch_name,
                 branch_name=child_branch,
                 status="failed",
                 commit_id=None,
@@ -193,6 +241,7 @@ class MCTSEngine:
             self.store.update_node_commit(child_branch, commit_id)
             self.store.mark_node_status(child_branch, "terminal", terminal_reason="no_changes")
             return StepChildResult(
+                parent_branch_name=prepared_child.parent_branch_name,
                 branch_name=child_branch,
                 status="terminal",
                 commit_id=commit_id,
@@ -225,6 +274,7 @@ class MCTSEngine:
         eval_id = str(uuid.uuid4())
         node_status = "ready" if result.utility is not None else "failed"
         terminal_reason = None if result.utility is not None else "objective_failed"
+        normalized_utility = None if result.utility is None else self._normalize_utility(result.utility)
         self.store.record_eval(
             eval_id=eval_id,
             branch_name=child_branch,
@@ -236,8 +286,10 @@ class MCTSEngine:
         )
         self._refresh_agent_context(child_branch, worktree_path, context)
         if result.utility is not None:
-            self.store.backprop(child_branch, result.utility)
+            assert normalized_utility is not None
+            self.store.backprop(child_branch, result.utility, normalized_utility)
         return StepChildResult(
+            parent_branch_name=prepared_child.parent_branch_name,
             branch_name=child_branch,
             status=node_status,
             commit_id=commit_id,
@@ -505,6 +557,18 @@ class MCTSEngine:
         if value is None:
             return "n/a"
         return f"{value:.12g}"
+
+    def _normalize_utility(self, utility: float) -> float:
+        observed = self.store.list_backprop_utilities()
+        sample = observed + [utility]
+        center = median(sample)
+        deviations = [abs(value - center) for value in sample]
+        mad = median(deviations)
+        scale = 1.4826 * mad
+        if scale <= NORMALIZED_UTILITY_EPS:
+            return 0.0
+        normalized = (utility - center) / scale
+        return max(-NORMALIZED_UTILITY_CLIP, min(NORMALIZED_UTILITY_CLIP, normalized))
 
     def _next_child_index(self, branch_prefix: str) -> int:
         pattern = re.compile(rf"^{re.escape(branch_prefix)}/(\d{{6}})$")

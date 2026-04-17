@@ -17,6 +17,9 @@ class CommandSpec:
 class SelectionSpec:
     policy: str
     exploration_constant: float
+    widening_coefficient: float
+    widening_exponent: float
+    virtual_loss: float
 
 
 @dataclass(frozen=True)
@@ -40,10 +43,14 @@ class SearchSpec:
     worktree_root: Path
     artifact_root: Path
     branch_prefix: str
-    expansion_width: int
+    iteration_budget: int
     selection: SelectionSpec
     expander: ExpanderSpec
     objective: ObjectiveSpec
+
+    @property
+    def expansion_width(self) -> int:
+        return self.iteration_budget
 
 
 @dataclass(frozen=True)
@@ -67,6 +74,7 @@ class SearchNodeRecord:
     child_count: int
     visit_count: int
     value_sum: float
+    normalized_value_sum: float
     last_utility: float | None
     last_raw_score: float | None
     last_eval_id: str | None
@@ -81,7 +89,7 @@ class SearchNodeRecord:
     def q_value(self) -> float:
         if self.visit_count <= 0:
             return 0.0
-        return self.value_sum / self.visit_count
+        return self.normalized_value_sum / self.visit_count
 
 
 @dataclass(frozen=True)
@@ -118,6 +126,7 @@ class SearchNoteRecord:
 
 @dataclass(frozen=True)
 class StepChildResult:
+    parent_branch_name: str
     branch_name: str
     status: str
     commit_id: str | None
@@ -129,8 +138,23 @@ class StepChildResult:
 
 @dataclass(frozen=True)
 class StepResult:
-    selected_branch: str
+    selected_parents: list[str]
     children: list[StepChildResult]
     frontier_count: int
     best_branch: str | None
     steps_completed: int
+
+    @property
+    def selected_branch(self) -> str:
+        if not self.selected_parents:
+            return ""
+        ordered_unique: list[str] = []
+        seen: set[str] = set()
+        for branch_name in self.selected_parents:
+            if branch_name in seen:
+                continue
+            seen.add(branch_name)
+            ordered_unique.append(branch_name)
+        if len(ordered_unique) == 1:
+            return ordered_unique[0]
+        return ", ".join(ordered_unique)

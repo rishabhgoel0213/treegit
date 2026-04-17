@@ -82,6 +82,16 @@ class TreeGitTestCase(unittest.TestCase):
             check=False,
         )
 
+    def assert_output_path_matches(self, stdout: str, expected_path: Path) -> None:
+        reported_path = None
+        for line in stdout.splitlines():
+            if line.startswith("output: "):
+                reported_path = Path(line.split(": ", 1)[1])
+                break
+        self.assertIsNotNone(reported_path)
+        assert reported_path is not None
+        self.assertEqual(reported_path.resolve(), expected_path.resolve())
+
     def read_scan_cache_blob_id(self, cache_path: Path, relative_path: str) -> str | None:
         conn = sqlite3.connect(cache_path)
         try:
@@ -682,8 +692,14 @@ print(json.dumps({
                     "root_branch": "root",
                     "worktree_root": str((self.workspace / "worktrees").resolve()),
                     "branch_prefix": "mcts",
-                    "expansion_width": 2,
-                    "selection": {"policy": "uct", "exploration_constant": 0.0},
+                    "iteration_budget": 2,
+                    "selection": {
+                        "policy": "ucb_budgeted",
+                        "exploration_constant": 0.0,
+                        "widening_coefficient": 2.0,
+                        "widening_exponent": 0.5,
+                        "virtual_loss": 1.0,
+                    },
                     "expander": {
                         "command": [sys.executable, str(expander_path)],
                         "env": {} if expander_env is None else expander_env,
@@ -739,7 +755,7 @@ print(json.dumps({
         engine.init_search(config_path)
 
         first = engine.step()
-        self.assertEqual(first.selected_branch, "root")
+        self.assertEqual(first.selected_parents, ["root", "root"])
         self.assertEqual([child.branch_name for child in first.children], [
             "mcts/000001",
             "mcts/000002",
@@ -756,7 +772,7 @@ print(json.dumps({
         self.assertEqual(root_node.child_count, 2)
         self.assertEqual(root_node.visit_count, 2)
         self.assertEqual(root_node.value_sum, 3.0)
-        self.assertEqual(root_node.status, "expanded")
+        self.assertEqual(root_node.status, "ready")
 
         best_after_first = engine.best()
         self.assertIsNotNone(best_after_first)
@@ -769,27 +785,28 @@ print(json.dumps({
         self.assertIn("Set fixture utility marker for mcts/000002.", first_note.note_text)
 
         second = engine.step()
-        self.assertEqual(second.selected_branch, "mcts/000002")
+        self.assertEqual(second.selected_parents, ["mcts/000002", "root"])
         self.assertEqual([child.branch_name for child in second.children], [
             "mcts/000003",
             "mcts/000004",
         ])
-        self.assertEqual([child.utility for child in second.children], [1.0, None])
-        self.assertEqual([child.status for child in second.children], ["ready", "terminal"])
+        self.assertEqual([child.utility for child in second.children], [1.0, 2.0])
+        self.assertEqual([child.status for child in second.children], ["ready", "ready"])
+        self.assertEqual([child.parent_branch_name for child in second.children], ["mcts/000002", "root"])
 
         selected_node = engine.store.get_node("mcts/000002")
         self.assertIsNotNone(selected_node)
         assert selected_node is not None
-        self.assertEqual(selected_node.child_count, 2)
-        self.assertEqual(selected_node.status, "expanded")
+        self.assertEqual(selected_node.child_count, 1)
+        self.assertEqual(selected_node.status, "ready")
 
         grandchild = engine.store.get_node("mcts/000004")
         self.assertIsNotNone(grandchild)
         assert grandchild is not None
-        self.assertEqual(grandchild.parent_branch_name, "mcts/000002")
-        self.assertIsNone(grandchild.last_utility)
-        self.assertEqual(grandchild.status, "terminal")
-        self.assertEqual(grandchild.terminal_reason, "no_changes")
+        self.assertEqual(grandchild.parent_branch_name, "root")
+        self.assertEqual(grandchild.last_utility, 2.0)
+        self.assertEqual(grandchild.status, "ready")
+        self.assertIsNone(grandchild.terminal_reason)
         second_note = engine.store.get_note("mcts/000003")
         self.assertIsNotNone(second_note)
         assert second_note is not None
@@ -797,7 +814,7 @@ print(json.dumps({
 
         status = engine.status()
         self.assertEqual(status["steps_completed"], 2)
-        self.assertEqual(status["frontier_count"], 2)
+        self.assertEqual(status["frontier_count"], 5)
         self.assertEqual(status["best_branch"], "mcts/000002")
 
     def test_mcts_objective_cache_reuses_equivalent_states_across_search_resets(self) -> None:
@@ -841,7 +858,7 @@ print(json.dumps({
 
         status = self.run_cli("mcts", "status", cwd=main_dir)
         self.assertEqual(status.returncode, 0, status.stderr)
-        self.assertIn("frontier_count: 2", status.stdout)
+        self.assertIn("frontier_count: 3", status.stdout)
         self.assertIn("best_branch: mcts/000002", status.stdout)
 
         best = self.run_cli("mcts", "best", cwd=main_dir)
@@ -851,7 +868,7 @@ print(json.dumps({
         plot_path = self.workspace / "best-path.svg"
         plot = self.run_cli("mcts", "plot", "--output", str(plot_path), cwd=main_dir)
         self.assertEqual(plot.returncode, 0, plot.stderr)
-        self.assertIn(f"output: {plot_path.resolve()}", plot.stdout)
+        self.assert_output_path_matches(plot.stdout, plot_path)
         self.assertIn("branch: mcts/000002", plot.stdout)
         self.assertIn("view: lineage", plot.stdout)
         self.assertTrue(plot_path.exists())
@@ -870,7 +887,7 @@ print(json.dumps({
             cwd=main_dir,
         )
         self.assertEqual(utility_plot.returncode, 0, utility_plot.stderr)
-        self.assertIn(f"output: {utility_plot_path.resolve()}", utility_plot.stdout)
+        self.assert_output_path_matches(utility_plot.stdout, utility_plot_path)
         self.assertIn("var: utility", utility_plot.stdout)
         self.assertIn("view: lineage", utility_plot.stdout)
         utility_svg = utility_plot_path.read_text(encoding="utf-8")
@@ -887,7 +904,7 @@ print(json.dumps({
             cwd=main_dir,
         )
         self.assertEqual(branch_plot.returncode, 0, branch_plot.stderr)
-        self.assertIn(f"output: {branch_plot_path.resolve()}", branch_plot.stdout)
+        self.assert_output_path_matches(branch_plot.stdout, branch_plot_path)
         self.assertIn("branch: mcts/000001", branch_plot.stdout)
         self.assertIn("view: lineage", branch_plot.stdout)
         branch_svg = branch_plot_path.read_text(encoding="utf-8")
@@ -905,7 +922,7 @@ print(json.dumps({
             cwd=main_dir,
         )
         self.assertEqual(tree_plot.returncode, 0, tree_plot.stderr)
-        self.assertIn(f"output: {tree_plot_path.resolve()}", tree_plot.stdout)
+        self.assert_output_path_matches(tree_plot.stdout, tree_plot_path)
         self.assertIn("branch: mcts/000002", tree_plot.stdout)
         self.assertIn("view: tree", tree_plot.stdout)
         tree_svg = tree_plot_path.read_text(encoding="utf-8")
@@ -942,7 +959,15 @@ print(json.dumps({
         )
         self.assertEqual(background.returncode, 0, background.stderr)
         self.assertIn("background_pid:", background.stdout)
-        self.assertIn(f"log_file: {log_path.resolve()}", background.stdout)
+        self.assertIn("log_file:", background.stdout)
+        reported_log_path = None
+        for line in background.stdout.splitlines():
+            if line.startswith("log_file: "):
+                reported_log_path = Path(line.split(": ", 1)[1])
+                break
+        self.assertIsNotNone(reported_log_path)
+        assert reported_log_path is not None
+        self.assertEqual(reported_log_path.resolve(), log_path.resolve())
 
         deadline = time.time() + 10.0
         log_text = ""
