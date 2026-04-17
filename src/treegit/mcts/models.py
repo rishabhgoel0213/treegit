@@ -74,7 +74,6 @@ class SearchNodeRecord:
     child_count: int
     visit_count: int
     value_sum: float
-    normalized_value_sum: float
     last_utility: float | None
     last_raw_score: float | None
     last_eval_id: str | None
@@ -89,7 +88,7 @@ class SearchNodeRecord:
     def q_value(self) -> float:
         if self.visit_count <= 0:
             return 0.0
-        return self.normalized_value_sum / self.visit_count
+        return self.value_sum / self.visit_count
 
 
 @dataclass(frozen=True)

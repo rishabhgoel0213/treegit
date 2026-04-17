@@ -86,9 +86,9 @@ def _parse_search_spec(raw: Any, repo_root: Path | None) -> SearchSpec:
 
     selection_raw = _require_object(raw, "selection", default={})
     policy = _require_string(selection_raw, "policy", default="ucb_budgeted")
-    if policy in {"uct", "ucb"}:
+    if policy == "ucb":
         policy = "ucb_budgeted"
-    if policy != "ucb_budgeted":
+    if policy not in {"ucb_budgeted", "uct"}:
         raise MCTSConfigError(f"unsupported selection policy: {policy}")
     exploration_constant = _require_float(selection_raw, "exploration_constant", default=1.4)
     widening_coefficient = _require_float(selection_raw, "widening_coefficient", default=2.0)

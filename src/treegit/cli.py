@@ -297,7 +297,6 @@ def run_command(args: argparse.Namespace) -> int:
                 print(f"raw_score: {best.last_raw_score}")
                 print(f"visits: {best.visit_count}")
                 print(f"value_sum: {best.value_sum}")
-                print(f"normalized_value_sum: {best.normalized_value_sum}")
             return 0
         if args.mcts_command == "inspect":
             node, evaluation = engine.inspect(args.branch)
@@ -309,7 +308,6 @@ def run_command(args: argparse.Namespace) -> int:
             print(f"child_count: {node.child_count}")
             print(f"visits: {node.visit_count}")
             print(f"value_sum: {node.value_sum}")
-            print(f"normalized_value_sum: {node.normalized_value_sum}")
             print(f"q_value: {node.q_value}")
             print(f"last_utility: {node.last_utility}")
             print(f"last_raw_score: {node.last_raw_score}")

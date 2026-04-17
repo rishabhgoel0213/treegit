@@ -22,8 +22,13 @@ MCTS_CONTEXT_DIR = ".treegit/mcts"
 CHANGE_HISTORY_NAME = "change_history.md"
 SCORE_HISTORY_NAME = "score_history.md"
 CURRENT_CHANGE_NAME = "current_change.md"
-NORMALIZED_UTILITY_CLIP = 3.0
 NORMALIZED_UTILITY_EPS = 1e-6
+
+
+@dataclass(frozen=True)
+class _SelectionNormalization:
+    median_utility: float
+    scale: float
 
 
 @dataclass(frozen=True)
@@ -51,7 +56,7 @@ class MCTSEngine:
 
     def step(self) -> StepResult:
         search = self.store.get_search()
-        selected_parents = self._select_nodes_for_budget(search)
+        selected_parents = self._select_nodes(search)
         child_indices = self.store.reserve_child_indices(len(selected_parents))
         prepared_children: list[_PreparedChild] = []
         for agent_slot, (selected, child_index) in enumerate(zip(selected_parents, child_indices), start=1):
@@ -145,10 +150,44 @@ class MCTSEngine:
             return node, None
         return node, self.store.get_eval(node.last_eval_id)
 
+    def _select_nodes(self, search) -> list[SearchNodeRecord]:
+        if search.spec.selection.policy == "uct":
+            selected = self._select_single_frontier_node(search)
+            return [selected] * search.spec.iteration_budget
+        return self._select_nodes_for_budget(search)
+
+    def _select_single_frontier_node(self, search) -> SearchNodeRecord:
+        frontier = self.store.list_frontier_nodes()
+        if not frontier:
+            raise MCTSSelectionError("no expandable frontier nodes remain")
+        normalization = self._selection_normalization()
+        scored: list[tuple[float, SearchNodeRecord]] = []
+        for node in frontier:
+            if node.visit_count <= 0:
+                score = float("inf")
+            else:
+                parent_visits = 1 if node.parent_visit_count is None else max(1, node.parent_visit_count)
+                score = self._normalized_node_q_value(node, normalization) + (
+                    search.spec.selection.exploration_constant
+                    * math.sqrt(math.log(parent_visits + 1.0) / node.visit_count)
+                )
+            scored.append((score, node))
+        scored.sort(
+            key=lambda item: (
+                item[0],
+                float("-inf") if item[1].last_utility is None else item[1].last_utility,
+                -item[1].depth,
+                item[1].branch_name,
+            ),
+            reverse=True,
+        )
+        return scored[0][1]
+
     def _select_nodes_for_budget(self, search) -> list[SearchNodeRecord]:
         expandable = self.store.list_expandable_nodes()
         if not expandable:
             raise MCTSSelectionError("no expandable nodes remain")
+        normalization = self._selection_normalization()
         root = self.store.get_node(search.root_branch)
         root_visits = 0 if root is None else root.visit_count
         pending_by_branch: dict[str, int] = defaultdict(int)
@@ -162,6 +201,7 @@ class MCTSEngine:
                     continue
                 score = self._score_expandable_node(
                     node,
+                    normalization=normalization,
                     pending_expansions=pending_expansions,
                     total_visits=total_visits,
                     selection=search.spec.selection,
@@ -200,13 +240,14 @@ class MCTSEngine:
         self,
         node: SearchNodeRecord,
         *,
+        normalization: _SelectionNormalization | None,
         pending_expansions: int,
         total_visits: int,
         selection: SelectionSpec,
     ) -> float:
         effective_visits = max(1, node.visit_count + pending_expansions)
         exploration = selection.exploration_constant * math.sqrt(math.log(total_visits + 1.0) / effective_visits)
-        score = node.q_value + exploration
+        score = self._normalized_node_q_value(node, normalization) + exploration
         if pending_expansions:
             score -= pending_expansions * selection.virtual_loss
         return score
@@ -274,7 +315,6 @@ class MCTSEngine:
         eval_id = str(uuid.uuid4())
         node_status = "ready" if result.utility is not None else "failed"
         terminal_reason = None if result.utility is not None else "objective_failed"
-        normalized_utility = None if result.utility is None else self._normalize_utility(result.utility)
         self.store.record_eval(
             eval_id=eval_id,
             branch_name=child_branch,
@@ -286,8 +326,7 @@ class MCTSEngine:
         )
         self._refresh_agent_context(child_branch, worktree_path, context)
         if result.utility is not None:
-            assert normalized_utility is not None
-            self.store.backprop(child_branch, result.utility, normalized_utility)
+            self.store.backprop(child_branch, result.utility)
         return StepChildResult(
             parent_branch_name=prepared_child.parent_branch_name,
             branch_name=child_branch,
@@ -558,17 +597,27 @@ class MCTSEngine:
             return "n/a"
         return f"{value:.12g}"
 
-    def _normalize_utility(self, utility: float) -> float:
+    def _selection_normalization(self) -> _SelectionNormalization | None:
         observed = self.store.list_backprop_utilities()
-        sample = observed + [utility]
-        center = median(sample)
-        deviations = [abs(value - center) for value in sample]
+        if not observed:
+            return None
+        center = median(observed)
+        deviations = [abs(value - center) for value in observed]
         mad = median(deviations)
         scale = 1.4826 * mad
         if scale <= NORMALIZED_UTILITY_EPS:
-            return 0.0
-        normalized = (utility - center) / scale
-        return max(-NORMALIZED_UTILITY_CLIP, min(NORMALIZED_UTILITY_CLIP, normalized))
+            return None
+        return _SelectionNormalization(median_utility=center, scale=scale)
+
+    def _normalized_node_q_value(
+        self,
+        node: SearchNodeRecord,
+        normalization: _SelectionNormalization | None,
+    ) -> float:
+        raw_q = node.q_value
+        if normalization is None:
+            return raw_q
+        return (raw_q - normalization.median_utility) / normalization.scale
 
     def _next_child_index(self, branch_prefix: str) -> int:
         pattern = re.compile(rf"^{re.escape(branch_prefix)}/(\d{{6}})$")

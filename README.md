@@ -140,7 +140,7 @@ The MCTS entrypoint is command-based and objective-agnostic. The config file is 
 - `expander.command`
 - `objective.id`, `objective.version`, and `objective.command`
 
-The expander command runs in a fresh worktree for each allocated budget slot. TreeGit uses a budgeted UCB selector with progressive widening, so one iteration can split work across multiple parent branches or spend multiple slots on the same parent when that still scores best. Objective commands still report raw `utility`, but TreeGit now backpropagates a clipped robust z-score normalization of observed utilities so exploration constants and virtual loss stay meaningful across objectives with very different score scales.
+The expander command runs in a fresh worktree for each allocated budget slot. With `selection.policy = "ucb_budgeted"`, TreeGit uses a budgeted UCB selector with progressive widening, so one iteration can split work across multiple parent branches or spend multiple slots on the same parent when that still scores best. With `selection.policy = "uct"`, TreeGit uses the older single-frontier UCT rule and spends the full `iteration_budget` on descendants of one selected frontier node. Objective commands still report and backpropagate raw `utility`, while selection normalizes each node's raw mean on the fly using the current run-wide median and MAD so exploration constants and virtual loss stay meaningful across objectives with very different score scales.
 
 ## Notes
 

@@ -589,7 +589,13 @@ class RepositoryIntegrationTests(TreeGitTestCase):
 
 
 class CliSmokeTests(TreeGitTestCase):
-    def build_mcts_fixture(self, repo_root: Path, *, expander_env: dict[str, str] | None = None) -> tuple[Path, Path]:
+    def build_mcts_fixture(
+        self,
+        repo_root: Path,
+        *,
+        expander_env: dict[str, str] | None = None,
+        selection_policy: str = "ucb_budgeted",
+    ) -> tuple[Path, Path]:
         scripts_dir = self.workspace / "scripts"
         scripts_dir.mkdir(parents=True, exist_ok=True)
         counter_path = self.workspace / "objective-counter.txt"
@@ -694,7 +700,7 @@ print(json.dumps({
                     "branch_prefix": "mcts",
                     "iteration_budget": 2,
                     "selection": {
-                        "policy": "ucb_budgeted",
+                        "policy": selection_policy,
                         "exploration_constant": 0.0,
                         "widening_coefficient": 2.0,
                         "widening_exponent": 0.5,
@@ -816,6 +822,35 @@ print(json.dumps({
         self.assertEqual(status["steps_completed"], 2)
         self.assertEqual(status["frontier_count"], 5)
         self.assertEqual(status["best_branch"], "mcts/000002")
+
+    def test_mcts_engine_uct_policy_expands_one_selected_frontier(self) -> None:
+        main_dir = self.workspace / "main"
+        repo = self.init_repo_at(main_dir)
+        (main_dir / "seed.txt").write_text("root\n", encoding="utf-8")
+        repo.commit("root base")
+        config_path, _ = self.build_mcts_fixture(main_dir, selection_policy="uct")
+
+        engine = MCTSEngine(repo)
+        engine.init_search(config_path)
+
+        first = engine.step()
+        self.assertEqual(first.selected_parents, ["root", "root"])
+        self.assertEqual([child.parent_branch_name for child in first.children], ["root", "root"])
+
+        second = engine.step()
+        self.assertEqual(second.selected_parents, ["mcts/000002", "mcts/000002"])
+        self.assertEqual([child.parent_branch_name for child in second.children], ["mcts/000002", "mcts/000002"])
+        self.assertEqual([child.branch_name for child in second.children], ["mcts/000003", "mcts/000004"])
+        self.assertEqual([child.utility for child in second.children], [1.0, None])
+        self.assertEqual([child.status for child in second.children], ["ready", "terminal"])
+
+        selected_node = engine.store.get_node("mcts/000002")
+        self.assertIsNotNone(selected_node)
+        assert selected_node is not None
+        self.assertEqual(selected_node.child_count, 2)
+
+        status = engine.status()
+        self.assertEqual(status["frontier_count"], 4)
 
     def test_mcts_objective_cache_reuses_equivalent_states_across_search_resets(self) -> None:
         main_dir = self.workspace / "main"

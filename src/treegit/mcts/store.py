@@ -577,7 +577,7 @@ class MCTSStore:
             conn.close()
         return [float(row["utility"]) for row in rows]
 
-    def backprop(self, branch_name: str, utility: float, normalized_utility: float) -> None:
+    def backprop(self, branch_name: str, utility: float) -> None:
         conn = self.index.connect()
         try:
             conn.execute("BEGIN")
@@ -589,11 +589,10 @@ class MCTSStore:
                     UPDATE mcts_nodes
                     SET visit_count = visit_count + 1,
                         value_sum = value_sum + ?,
-                        normalized_value_sum = normalized_value_sum + ?,
                         updated_at = ?
                     WHERE run_id = ? AND branch_name = ?
                     """,
-                    (utility, normalized_utility, now, ACTIVE_SEARCH_ID, current_branch),
+                    (utility, now, ACTIVE_SEARCH_ID, current_branch),
                 )
                 row = conn.execute(
                     """
@@ -737,7 +736,6 @@ def _row_to_node(row) -> SearchNodeRecord:
         child_count=int(row["child_count"]),
         visit_count=int(row["visit_count"]),
         value_sum=float(row["value_sum"]),
-        normalized_value_sum=float(row["normalized_value_sum"]),
         last_utility=None if row["last_utility"] is None else float(row["last_utility"]),
         last_raw_score=None if row["last_raw_score"] is None else float(row["last_raw_score"]),
         last_eval_id=row["last_eval_id"],
