@@ -16,6 +16,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-file", type=Path, required=True, help="Prompt template file.")
     parser.add_argument("--model", default=None, help="Optional Codex model override.")
     parser.add_argument(
+        "--reasoning-effort",
+        choices=("low", "medium", "high", "xhigh"),
+        default=None,
+        help="Optional Codex reasoning effort override.",
+    )
+    parser.add_argument(
         "--tmux",
         action="store_true",
         help="Run Codex inside a detached tmux session and wait for it to finish.",
@@ -71,6 +77,8 @@ def main() -> int:
         command.extend(["--sandbox", "workspace-write"])
     if args.model:
         command.extend(["--model", args.model])
+    if args.reasoning_effort:
+        command.extend(["-c", f"model_reasoning_effort={json.dumps(args.reasoning_effort)}"])
     command.append(prompt)
 
     if args.tmux:
